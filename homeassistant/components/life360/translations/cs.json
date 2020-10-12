@@ -1,0 +1,20 @@
+{
+    "config": {
+        "abort": {
+            "invalid_credentials": "Neplatn\u00e9 p\u0159ihla\u0161ovac\u00ed \u00fadaje",
+            "user_already_configured": "\u00da\u010det je ji\u017e nastaven"
+        },
+        "error": {
+            "invalid_credentials": "Neplatn\u00e9 p\u0159ihla\u0161ovac\u00ed \u00fadaje",
+            "user_already_configured": "\u00da\u010det je ji\u017e nastaven"
+        },
+        "step": {
+            "user": {
+                "data": {
+                    "password": "Heslo",
+                    "username": "U\u017eivatelsk\u00e9 jm\u00e9no"
+                }
+            }
+        }
+    }
+}

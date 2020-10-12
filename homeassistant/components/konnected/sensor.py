@@ -9,8 +9,8 @@ from homeassistant.const import (
     CONF_ZONE,
     DEVICE_CLASS_HUMIDITY,
     DEVICE_CLASS_TEMPERATURE,
+    PERCENTAGE,
     TEMP_CELSIUS,
-    UNIT_PERCENTAGE,
 )
 from homeassistant.core import callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
@@ -22,7 +22,7 @@ _LOGGER = logging.getLogger(__name__)
 
 SENSOR_TYPES = {
     DEVICE_CLASS_TEMPERATURE: ["Temperature", TEMP_CELSIUS],
-    DEVICE_CLASS_HUMIDITY: ["Humidity", UNIT_PERCENTAGE],
+    DEVICE_CLASS_HUMIDITY: ["Humidity", PERCENTAGE],
 }
 
 
@@ -137,4 +137,4 @@ class KonnectedSensor(Entity):
             self._state = int(float(state))
         else:
             self._state = round(float(state), 1)
-        self.async_schedule_update_ha_state()
+        self.async_write_ha_state()

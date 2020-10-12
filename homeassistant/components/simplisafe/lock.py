@@ -1,17 +1,13 @@
 """Support for SimpliSafe locks."""
-import logging
-
 from simplipy.errors import SimplipyError
 from simplipy.lock import LockStates
 from simplipy.websocket import EVENT_LOCK_LOCKED, EVENT_LOCK_UNLOCKED
 
-from homeassistant.components.lock import LockDevice
+from homeassistant.components.lock import LockEntity
 from homeassistant.core import callback
 
 from . import SimpliSafeEntity
-from .const import DATA_CLIENT, DOMAIN
-
-_LOGGER = logging.getLogger(__name__)
+from .const import DATA_CLIENT, DOMAIN, LOGGER
 
 ATTR_LOCK_LOW_BATTERY = "lock_low_battery"
 ATTR_JAMMED = "jammed"
@@ -30,7 +26,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
     )
 
 
-class SimpliSafeLock(SimpliSafeEntity, LockDevice):
+class SimpliSafeLock(SimpliSafeEntity, LockEntity):
     """Define a SimpliSafe lock."""
 
     def __init__(self, simplisafe, system, lock):
@@ -52,7 +48,7 @@ class SimpliSafeLock(SimpliSafeEntity, LockDevice):
         try:
             await self._lock.lock()
         except SimplipyError as err:
-            _LOGGER.error('Error while locking "%s": %s', self._lock.name, err)
+            LOGGER.error('Error while locking "%s": %s', self._lock.name, err)
             return
 
         self._is_locked = True
@@ -62,7 +58,7 @@ class SimpliSafeLock(SimpliSafeEntity, LockDevice):
         try:
             await self._lock.unlock()
         except SimplipyError as err:
-            _LOGGER.error('Error while unlocking "%s": %s', self._lock.name, err)
+            LOGGER.error('Error while unlocking "%s": %s', self._lock.name, err)
             return
 
         self._is_locked = False

@@ -5,6 +5,7 @@ from xml.parsers.expat import ExpatError
 
 from jsonpath import jsonpath
 import requests
+from requests import Session
 from requests.auth import HTTPBasicAuth, HTTPDigestAuth
 import voluptuous as vol
 import xmltodict
@@ -32,6 +33,9 @@ from homeassistant.const import (
 from homeassistant.exceptions import PlatformNotReady
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity import Entity
+from homeassistant.helpers.reload import setup_reload_service
+
+from . import DOMAIN, PLATFORMS
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -77,6 +81,8 @@ PLATFORM_SCHEMA = vol.All(
 
 def setup_platform(hass, config, add_entities, discovery_info=None):
     """Set up the RESTful sensor."""
+    setup_reload_service(hass, DOMAIN, PLATFORMS)
+
     name = config.get(CONF_NAME)
     resource = config.get(CONF_RESOURCE)
     resource_template = config.get(CONF_RESOURCE_TEMPLATE)
@@ -215,7 +221,7 @@ class RestSensor(Entity):
                     _LOGGER.debug("JSON converted from XML: %s", value)
                 except ExpatError:
                     _LOGGER.warning(
-                        "REST xml result could not be parsed and converted to JSON."
+                        "REST xml result could not be parsed and converted to JSON"
                     )
                     _LOGGER.debug("Erroneous XML: %s", value)
 
@@ -271,8 +277,13 @@ class RestData:
         self._request_data = data
         self._verify_ssl = verify_ssl
         self._timeout = timeout
+        self._http_session = Session()
         self.data = None
         self.headers = None
+
+    def __del__(self):
+        """Destroy the http session on destroy."""
+        self._http_session.close()
 
     def set_url(self, url):
         """Set url."""
@@ -282,7 +293,7 @@ class RestData:
         """Get the latest data from REST service with provided method."""
         _LOGGER.debug("Updating from %s", self._resource)
         try:
-            response = requests.request(
+            response = self._http_session.request(
                 self._method,
                 self._resource,
                 headers=self._headers,

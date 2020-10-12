@@ -104,9 +104,7 @@ class ImageProcessingAlprEntity(ImageProcessingEntity):
     @property
     def state_attributes(self):
         """Return device specific state attributes."""
-        attr = {ATTR_PLATES: self.plates, ATTR_VEHICLES: self.vehicles}
-
-        return attr
+        return {ATTR_PLATES: self.plates, ATTR_VEHICLES: self.vehicles}
 
     def process_plates(self, plates, vehicles):
         """Send event with new plates and store data."""
@@ -161,7 +159,7 @@ class OpenAlprLocalEntity(ImageProcessingAlprEntity):
         if name:
             self._name = name
         else:
-            self._name = "OpenAlpr {0}".format(split_entity_id(camera_entity)[1])
+            self._name = f"OpenAlpr {split_entity_id(camera_entity)[1]}"
 
     @property
     def confidence(self):

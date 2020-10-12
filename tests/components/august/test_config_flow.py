@@ -1,5 +1,4 @@
 """Test the August config flow."""
-from asynctest import patch
 from august.authenticator import ValidationResult
 
 from homeassistant import config_entries, setup
@@ -17,6 +16,9 @@ from homeassistant.components.august.exceptions import (
 )
 from homeassistant.const import CONF_PASSWORD, CONF_TIMEOUT, CONF_USERNAME
 
+from tests.async_mock import patch
+from tests.common import MockConfigEntry
+
 
 async def test_form(hass):
     """Test we get the form."""
@@ -28,12 +30,13 @@ async def test_form(hass):
     assert result["errors"] == {}
 
     with patch(
-        "homeassistant.components.august.config_flow.AugustGateway.authenticate",
+        "homeassistant.components.august.config_flow.AugustGateway.async_authenticate",
         return_value=True,
     ), patch(
         "homeassistant.components.august.async_setup", return_value=True
     ) as mock_setup, patch(
-        "homeassistant.components.august.async_setup_entry", return_value=True,
+        "homeassistant.components.august.async_setup_entry",
+        return_value=True,
     ) as mock_setup_entry:
         result2 = await hass.config_entries.flow.async_configure(
             result["flow_id"],
@@ -66,7 +69,7 @@ async def test_form_invalid_auth(hass):
     )
 
     with patch(
-        "homeassistant.components.august.config_flow.AugustGateway.authenticate",
+        "homeassistant.components.august.config_flow.AugustGateway.async_authenticate",
         side_effect=InvalidAuth,
     ):
         result2 = await hass.config_entries.flow.async_configure(
@@ -82,6 +85,29 @@ async def test_form_invalid_auth(hass):
     assert result2["errors"] == {"base": "invalid_auth"}
 
 
+async def test_user_unexpected_exception(hass):
+    """Test we handle an unexpected exception."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+
+    with patch(
+        "homeassistant.components.august.config_flow.AugustGateway.async_authenticate",
+        side_effect=ValueError,
+    ):
+        result2 = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {
+                CONF_LOGIN_METHOD: "email",
+                CONF_USERNAME: "my@email.tld",
+                CONF_PASSWORD: "test-password",
+            },
+        )
+
+    assert result2["type"] == "form"
+    assert result2["errors"] == {"base": "unknown"}
+
+
 async def test_form_cannot_connect(hass):
     """Test we handle cannot connect error."""
     result = await hass.config_entries.flow.async_init(
@@ -89,7 +115,7 @@ async def test_form_cannot_connect(hass):
     )
 
     with patch(
-        "homeassistant.components.august.config_flow.AugustGateway.authenticate",
+        "homeassistant.components.august.config_flow.AugustGateway.async_authenticate",
         side_effect=CannotConnect,
     ):
         result2 = await hass.config_entries.flow.async_configure(
@@ -112,10 +138,10 @@ async def test_form_needs_validate(hass):
     )
 
     with patch(
-        "homeassistant.components.august.config_flow.AugustGateway.authenticate",
+        "homeassistant.components.august.config_flow.AugustGateway.async_authenticate",
         side_effect=RequireValidation,
     ), patch(
-        "homeassistant.components.august.gateway.Authenticator.send_verification_code",
+        "homeassistant.components.august.gateway.AuthenticatorAsync.async_send_verification_code",
         return_value=True,
     ) as mock_send_verification_code:
         result2 = await hass.config_entries.flow.async_configure(
@@ -134,13 +160,13 @@ async def test_form_needs_validate(hass):
 
     # Try with the WRONG verification code give us the form back again
     with patch(
-        "homeassistant.components.august.config_flow.AugustGateway.authenticate",
+        "homeassistant.components.august.config_flow.AugustGateway.async_authenticate",
         side_effect=RequireValidation,
     ), patch(
-        "homeassistant.components.august.gateway.Authenticator.validate_verification_code",
+        "homeassistant.components.august.gateway.AuthenticatorAsync.async_validate_verification_code",
         return_value=ValidationResult.INVALID_VERIFICATION_CODE,
     ) as mock_validate_verification_code, patch(
-        "homeassistant.components.august.gateway.Authenticator.send_verification_code",
+        "homeassistant.components.august.gateway.AuthenticatorAsync.async_send_verification_code",
         return_value=True,
     ) as mock_send_verification_code, patch(
         "homeassistant.components.august.async_setup", return_value=True
@@ -148,7 +174,8 @@ async def test_form_needs_validate(hass):
         "homeassistant.components.august.async_setup_entry", return_value=True
     ) as mock_setup_entry:
         result3 = await hass.config_entries.flow.async_configure(
-            result["flow_id"], {VERIFICATION_CODE_KEY: "incorrect"},
+            result["flow_id"],
+            {VERIFICATION_CODE_KEY: "incorrect"},
         )
 
     # Make sure we do not resend the code again
@@ -161,13 +188,13 @@ async def test_form_needs_validate(hass):
 
     # Try with the CORRECT verification code and we setup
     with patch(
-        "homeassistant.components.august.config_flow.AugustGateway.authenticate",
+        "homeassistant.components.august.config_flow.AugustGateway.async_authenticate",
         return_value=True,
     ), patch(
-        "homeassistant.components.august.gateway.Authenticator.validate_verification_code",
+        "homeassistant.components.august.gateway.AuthenticatorAsync.async_validate_verification_code",
         return_value=ValidationResult.VALIDATED,
     ) as mock_validate_verification_code, patch(
-        "homeassistant.components.august.gateway.Authenticator.send_verification_code",
+        "homeassistant.components.august.gateway.AuthenticatorAsync.async_send_verification_code",
         return_value=True,
     ) as mock_send_verification_code, patch(
         "homeassistant.components.august.async_setup", return_value=True
@@ -175,7 +202,8 @@ async def test_form_needs_validate(hass):
         "homeassistant.components.august.async_setup_entry", return_value=True
     ) as mock_setup_entry:
         result4 = await hass.config_entries.flow.async_configure(
-            result["flow_id"], {VERIFICATION_CODE_KEY: "correct"},
+            result["flow_id"],
+            {VERIFICATION_CODE_KEY: "correct"},
         )
 
     assert len(mock_send_verification_code.mock_calls) == 0
@@ -190,6 +218,52 @@ async def test_form_needs_validate(hass):
         CONF_TIMEOUT: 10,
         CONF_ACCESS_TOKEN_CACHE_FILE: ".my@email.tld.august.conf",
     }
+    await hass.async_block_till_done()
+    assert len(mock_setup.mock_calls) == 1
+    assert len(mock_setup_entry.mock_calls) == 1
+
+
+async def test_form_reauth(hass):
+    """Test reauthenticate."""
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_LOGIN_METHOD: "email",
+            CONF_USERNAME: "my@email.tld",
+            CONF_PASSWORD: "test-password",
+            CONF_INSTALL_ID: None,
+            CONF_TIMEOUT: 10,
+            CONF_ACCESS_TOKEN_CACHE_FILE: ".my@email.tld.august.conf",
+        },
+        unique_id="my@email.tld",
+    )
+    entry.add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": "reauth"}, data=entry.data
+    )
+    assert result["type"] == "form"
+    assert result["errors"] == {}
+
+    with patch(
+        "homeassistant.components.august.config_flow.AugustGateway.async_authenticate",
+        return_value=True,
+    ), patch(
+        "homeassistant.components.august.async_setup", return_value=True
+    ) as mock_setup, patch(
+        "homeassistant.components.august.async_setup_entry",
+        return_value=True,
+    ) as mock_setup_entry:
+        result2 = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {
+                CONF_PASSWORD: "new-test-password",
+            },
+        )
+
+    assert result2["type"] == "abort"
+    assert result2["reason"] == "reauth_successful"
     await hass.async_block_till_done()
     assert len(mock_setup.mock_calls) == 1
     assert len(mock_setup_entry.mock_calls) == 1

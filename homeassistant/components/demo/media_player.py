@@ -1,5 +1,5 @@
 """Demo implementation of the media player."""
-from homeassistant.components.media_player import MediaPlayerDevice
+from homeassistant.components.media_player import MediaPlayerEntity
 from homeassistant.components.media_player.const import (
     MEDIA_TYPE_MOVIE,
     MEDIA_TYPE_MUSIC,
@@ -61,7 +61,6 @@ YOUTUBE_PLAYER_SUPPORT = (
     | SUPPORT_PLAY
     | SUPPORT_SHUFFLE_SET
     | SUPPORT_SELECT_SOUND_MODE
-    | SUPPORT_SELECT_SOURCE
     | SUPPORT_SEEK
 )
 
@@ -93,7 +92,7 @@ NETFLIX_PLAYER_SUPPORT = (
 )
 
 
-class AbstractDemoPlayer(MediaPlayerDevice):
+class AbstractDemoPlayer(MediaPlayerEntity):
     """A demo media players."""
 
     # We only implement the methods that we support
@@ -397,6 +396,7 @@ class DemoTVShowPlayer(AbstractDemoPlayer):
         self._cur_episode = 1
         self._episode_count = 13
         self._source = "dvd"
+        self._source_list = ["dvd", "youtube"]
 
     @property
     def media_content_id(self):
@@ -447,6 +447,11 @@ class DemoTVShowPlayer(AbstractDemoPlayer):
     def source(self):
         """Return the current input source."""
         return self._source
+
+    @property
+    def source_list(self):
+        """List of available sources."""
+        return self._source_list
 
     @property
     def supported_features(self):

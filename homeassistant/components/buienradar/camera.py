@@ -29,9 +29,7 @@ PLATFORM_SCHEMA = vol.All(
     PLATFORM_SCHEMA.extend(
         {
             vol.Optional(CONF_DIMENSION, default=512): DIM_RANGE,
-            vol.Optional(CONF_DELTA, default=600.0): vol.All(
-                vol.Coerce(float), vol.Range(min=0)
-            ),
+            vol.Optional(CONF_DELTA, default=600.0): cv.positive_float,
             vol.Optional(CONF_NAME, default="Buienradar loop"): cv.string,
             vol.Optional(CONF_COUNTRY, default="NL"): vol.All(
                 vol.Coerce(str), vol.In(SUPPORTED_COUNTRY_CODES)
@@ -95,6 +93,8 @@ class BuienradarCam(Camera):
         # deadline for image refresh - self.delta after last successful load
         self._deadline: Optional[datetime] = None
 
+        self._unique_id = f"{self._dimension}_{self._country}"
+
     @property
     def name(self) -> str:
         """Return the component name."""
@@ -128,7 +128,7 @@ class BuienradarCam(Camera):
                     _LOG.debug("HTTP 304 - success")
                     return True
 
-                last_modified = res.headers.get("Last-Modified", None)
+                last_modified = res.headers.get("Last-Modified")
                 if last_modified:
                     self._last_modified = last_modified
 
@@ -186,3 +186,8 @@ class BuienradarCam(Camera):
             async with self._condition:
                 self._loading = False
                 self._condition.notify_all()
+
+    @property
+    def unique_id(self):
+        """Return the unique id."""
+        return self._unique_id

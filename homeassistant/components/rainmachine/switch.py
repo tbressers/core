@@ -4,8 +4,9 @@ import logging
 
 from regenmaschine.errors import RequestError
 
-from homeassistant.components.switch import SwitchDevice
+from homeassistant.components.switch import SwitchEntity
 from homeassistant.const import ATTR_ID
+from homeassistant.core import callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
 from . import RainMachineEntity
@@ -21,7 +22,6 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-ATTR_NEXT_RUN = "next_run"
 ATTR_AREA = "area"
 ATTR_CS_ON = "cs_on"
 ATTR_CURRENT_CYCLE = "current_cycle"
@@ -29,6 +29,7 @@ ATTR_CYCLES = "cycles"
 ATTR_DELAY = "delay"
 ATTR_DELAY_ON = "delay_on"
 ATTR_FIELD_CAPACITY = "field_capacity"
+ATTR_NEXT_RUN = "next_run"
 ATTR_NO_CYCLES = "number_of_cycles"
 ATTR_PRECIP_RATE = "sprinkler_head_precipitation_rate"
 ATTR_RESTRICTIONS = "restrictions"
@@ -38,12 +39,13 @@ ATTR_SOIL_TYPE = "soil_type"
 ATTR_SPRINKLER_TYPE = "sprinkler_head_type"
 ATTR_STATUS = "status"
 ATTR_SUN_EXPOSURE = "sun_exposure"
+ATTR_TIME_REMAINING = "time_remaining"
 ATTR_VEGETATION_TYPE = "vegetation_type"
 ATTR_ZONES = "zones"
 
 DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
-PROGRAM_STATUS_MAP = {0: "Not Running", 1: "Running", 2: "Queued"}
+RUN_STATUS_MAP = {0: "Not Running", 1: "Running", 2: "Queued"}
 
 SOIL_TYPE_MAP = {
     0: "Not Set",
@@ -110,7 +112,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
     async_add_entities(entities, True)
 
 
-class RainMachineSwitch(RainMachineEntity, SwitchDevice):
+class RainMachineSwitch(RainMachineEntity, SwitchEntity):
     """A class to represent a generic RainMachine switch."""
 
     def __init__(self, rainmachine, switch_data):
@@ -141,7 +143,7 @@ class RainMachineSwitch(RainMachineEntity, SwitchDevice):
     @property
     def unique_id(self) -> str:
         """Return a unique, Home Assistant friendly identifier for this entity."""
-        return "{0}_{1}_{2}".format(
+        return "{}_{}_{}".format(
             self.rainmachine.device_mac.replace(":", ""),
             self._switch_type,
             self._rainmachine_entity_id,
@@ -187,7 +189,7 @@ class RainMachineProgram(RainMachineSwitch):
 
     async def async_added_to_hass(self):
         """Register callbacks."""
-        self._dispatcher_handlers.append(
+        self.async_on_remove(
             async_dispatcher_connect(
                 self.hass, PROGRAM_UPDATE_TOPIC, self._update_state
             )
@@ -205,7 +207,8 @@ class RainMachineProgram(RainMachineSwitch):
             self.rainmachine.controller.programs.start(self._rainmachine_entity_id)
         )
 
-    async def async_update(self) -> None:
+    @callback
+    def update_from_latest_data(self) -> None:
         """Update info for the program."""
         [self._switch_data] = [
             p
@@ -217,7 +220,7 @@ class RainMachineProgram(RainMachineSwitch):
 
         try:
             next_run = datetime.strptime(
-                "{0} {1}".format(
+                "{} {}".format(
                     self._switch_data["nextRun"], self._switch_data["startTime"]
                 ),
                 "%Y-%m-%d %H:%M",
@@ -230,7 +233,7 @@ class RainMachineProgram(RainMachineSwitch):
                 ATTR_ID: self._switch_data["uid"],
                 ATTR_NEXT_RUN: next_run,
                 ATTR_SOAK: self._switch_data.get("soak"),
-                ATTR_STATUS: PROGRAM_STATUS_MAP[self._switch_data["status"]],
+                ATTR_STATUS: RUN_STATUS_MAP[self._switch_data["status"]],
                 ATTR_ZONES: ", ".join(z["name"] for z in self.zones),
             }
         )
@@ -246,12 +249,12 @@ class RainMachineZone(RainMachineSwitch):
 
     async def async_added_to_hass(self):
         """Register callbacks."""
-        self._dispatcher_handlers.append(
+        self.async_on_remove(
             async_dispatcher_connect(
                 self.hass, PROGRAM_UPDATE_TOPIC, self._update_state
             )
         )
-        self._dispatcher_handlers.append(
+        self.async_on_remove(
             async_dispatcher_connect(self.hass, ZONE_UPDATE_TOPIC, self._update_state)
         )
 
@@ -269,7 +272,8 @@ class RainMachineZone(RainMachineSwitch):
             )
         )
 
-    async def async_update(self) -> None:
+    @callback
+    def update_from_latest_data(self) -> None:
         """Update info for the zone."""
         [self._switch_data] = [
             z
@@ -286,10 +290,11 @@ class RainMachineZone(RainMachineSwitch):
 
         self._attrs.update(
             {
-                ATTR_ID: self._switch_data["uid"],
+                ATTR_STATUS: RUN_STATUS_MAP[self._switch_data["state"]],
                 ATTR_AREA: details.get("waterSense").get("area"),
                 ATTR_CURRENT_CYCLE: self._switch_data.get("cycle"),
                 ATTR_FIELD_CAPACITY: details.get("waterSense").get("fieldCapacity"),
+                ATTR_ID: self._switch_data["uid"],
                 ATTR_NO_CYCLES: self._switch_data.get("noOfCycles"),
                 ATTR_PRECIP_RATE: details.get("waterSense").get("precipitationRate"),
                 ATTR_RESTRICTIONS: self._switch_data.get("restriction"),
@@ -297,6 +302,7 @@ class RainMachineZone(RainMachineSwitch):
                 ATTR_SOIL_TYPE: SOIL_TYPE_MAP.get(details.get("sun")),
                 ATTR_SPRINKLER_TYPE: SPRINKLER_TYPE_MAP.get(details.get("group_id")),
                 ATTR_SUN_EXPOSURE: SUN_EXPOSURE_MAP.get(details.get("sun")),
+                ATTR_TIME_REMAINING: self._switch_data.get("remaining"),
                 ATTR_VEGETATION_TYPE: VEGETATION_MAP.get(self._switch_data.get("type")),
             }
         )

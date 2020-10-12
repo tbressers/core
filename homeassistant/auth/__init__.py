@@ -215,12 +215,14 @@ class AuthManager:
 
         return user
 
-    async def async_create_user(self, name: str) -> models.User:
+    async def async_create_user(
+        self, name: str, group_ids: Optional[List[str]] = None
+    ) -> models.User:
         """Create a user."""
         kwargs: Dict[str, Any] = {
             "name": name,
             "is_active": True,
-            "group_ids": [GROUP_ID_ADMIN],
+            "group_ids": group_ids or [],
         }
 
         if await self._user_should_be_owner():
@@ -310,9 +312,7 @@ class AuthManager:
 
         if provider is not None and hasattr(provider, "async_will_remove_credentials"):
             # https://github.com/python/mypy/issues/1424
-            await provider.async_will_remove_credentials(  # type: ignore
-                credentials
-            )
+            await provider.async_will_remove_credentials(credentials)  # type: ignore
 
         await self._store.async_remove_credentials(credentials)
 

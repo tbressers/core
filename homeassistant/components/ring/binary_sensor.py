@@ -2,7 +2,11 @@
 from datetime import datetime
 import logging
 
-from homeassistant.components.binary_sensor import BinarySensorDevice
+from homeassistant.components.binary_sensor import (
+    DEVICE_CLASS_MOTION,
+    DEVICE_CLASS_OCCUPANCY,
+    BinarySensorEntity,
+)
 from homeassistant.core import callback
 
 from . import DOMAIN
@@ -12,8 +16,12 @@ _LOGGER = logging.getLogger(__name__)
 
 # Sensor types: Name, category, device_class
 SENSOR_TYPES = {
-    "ding": ["Ding", ["doorbots", "authorized_doorbots"], "occupancy"],
-    "motion": ["Motion", ["doorbots", "authorized_doorbots", "stickup_cams"], "motion"],
+    "ding": ["Ding", ["doorbots", "authorized_doorbots"], DEVICE_CLASS_OCCUPANCY],
+    "motion": [
+        "Motion",
+        ["doorbots", "authorized_doorbots", "stickup_cams"],
+        DEVICE_CLASS_MOTION,
+    ],
 }
 
 
@@ -37,7 +45,7 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     async_add_entities(sensors)
 
 
-class RingBinarySensor(RingEntityMixin, BinarySensorDevice):
+class RingBinarySensor(RingEntityMixin, BinarySensorEntity):
     """A binary sensor implementation for Ring device."""
 
     _active_alert = None
@@ -47,9 +55,7 @@ class RingBinarySensor(RingEntityMixin, BinarySensorDevice):
         super().__init__(config_entry_id, device)
         self._ring = ring
         self._sensor_type = sensor_type
-        self._name = "{0} {1}".format(
-            self._device.name, SENSOR_TYPES.get(sensor_type)[0]
-        )
+        self._name = "{} {}".format(self._device.name, SENSOR_TYPES.get(sensor_type)[0])
         self._device_class = SENSOR_TYPES.get(sensor_type)[2]
         self._state = None
         self._unique_id = f"{device.id}-{sensor_type}"

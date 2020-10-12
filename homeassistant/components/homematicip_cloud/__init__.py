@@ -18,7 +18,7 @@ from .const import (
     HMIPC_HAPID,
     HMIPC_NAME,
 )
-from .device import HomematicipGenericDevice  # noqa: F401
+from .generic_entity import HomematicipGenericEntity  # noqa: F401
 from .hap import HomematicipAuth, HomematicipHAP  # noqa: F401
 from .services import async_setup_services, async_unload_services
 
@@ -50,10 +50,10 @@ async def async_setup(hass: HomeAssistantType, config: ConfigType) -> bool:
     accesspoints = config.get(DOMAIN, [])
 
     for conf in accesspoints:
-        if conf[CONF_ACCESSPOINT] not in set(
+        if conf[CONF_ACCESSPOINT] not in {
             entry.data[HMIPC_HAPID]
             for entry in hass.config_entries.async_entries(DOMAIN)
-        ):
+        }:
             hass.async_add_job(
                 hass.config_entries.flow.async_init(
                     DOMAIN,
@@ -99,7 +99,7 @@ async def async_setup_entry(hass: HomeAssistantType, entry: ConfigEntry) -> bool
     # Add the HAP name from configuration if set.
     hapname = home.label if not home.name else f"{home.name} {home.label}"
     device_registry.async_get_or_create(
-        config_entry_id=home.id,
+        config_entry_id=entry.entry_id,
         identifiers={(DOMAIN, home.id)},
         manufacturer="eQ-3",
         name=hapname,

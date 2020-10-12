@@ -14,10 +14,12 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.const import (
     ATTR_UNIT_OF_MEASUREMENT,
+    LIGHT_LUX,
+    PERCENTAGE,
     POWER_WATT,
+    PRESSURE_HPA,
     STATE_UNKNOWN,
     TEMP_CELSIUS,
-    UNIT_PERCENTAGE,
 )
 from homeassistant.core import callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
@@ -29,7 +31,6 @@ from .core.const import (
     CHANNEL_ELECTRICAL_MEASUREMENT,
     CHANNEL_HUMIDITY,
     CHANNEL_ILLUMINANCE,
-    CHANNEL_MULTISTATE_INPUT,
     CHANNEL_POWER_CONFIGURATION,
     CHANNEL_PRESSURE,
     CHANNEL_SMARTENERGY_METERING,
@@ -68,7 +69,7 @@ STRICT_MATCH = functools.partial(ZHA_ENTITIES.strict_match, DOMAIN)
 
 async def async_setup_entry(hass, config_entry, async_add_entities):
     """Set up the Zigbee Home Automation sensor from config entry."""
-    entities_to_create = hass.data[DATA_ZHA][DOMAIN] = []
+    entities_to_create = hass.data[DATA_ZHA][DOMAIN]
 
     unsub = async_dispatcher_connect(
         hass,
@@ -83,6 +84,7 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
 class Sensor(ZhaEntity):
     """Base ZHA sensor."""
 
+    SENSOR_ATTR = None
     _decimals = 1
     _device_class = None
     _divisor = 1
@@ -99,10 +101,10 @@ class Sensor(ZhaEntity):
         await super().async_added_to_hass()
         self._device_state_attributes.update(await self.async_state_attr_provider())
 
-        await self.async_accept_signal(
+        self.async_accept_signal(
             self._channel, SIGNAL_ATTR_UPDATED, self.async_set_state
         )
-        await self.async_accept_signal(
+        self.async_accept_signal(
             self._channel, SIGNAL_STATE_ATTR, self.async_update_state_attribute
         )
 
@@ -124,19 +126,20 @@ class Sensor(ZhaEntity):
         return self._state
 
     @callback
-    def async_set_state(self, state):
+    def async_set_state(self, attr_id, attr_name, value):
         """Handle state update from channel."""
-        if state is not None:
-            state = self.formatter(state)
-        self._state = state
-        self.async_schedule_update_ha_state()
+        if self.SENSOR_ATTR is None or self.SENSOR_ATTR != attr_name:
+            return
+        if value is not None:
+            value = self.formatter(value)
+        self._state = value
+        self.async_write_ha_state()
 
     @callback
     def async_restore_last_state(self, last_state):
         """Restore previous state."""
         self._state = last_state.state
 
-    @callback
     async def async_state_attr_provider(self):
         """Initialize device state attributes."""
         return {}
@@ -150,19 +153,20 @@ class Sensor(ZhaEntity):
         return round(float(value * self._multiplier) / self._divisor)
 
 
-@STRICT_MATCH(channel_names=CHANNEL_ANALOG_INPUT)
+@STRICT_MATCH(channel_names=CHANNEL_ANALOG_INPUT, manufacturers="Digi")
 class AnalogInput(Sensor):
     """Sensor that displays analog input values."""
 
-    pass
+    SENSOR_ATTR = "present_value"
 
 
 @STRICT_MATCH(channel_names=CHANNEL_POWER_CONFIGURATION)
 class Battery(Sensor):
     """Battery sensor of power configuration cluster."""
 
+    SENSOR_ATTR = "battery_percentage_remaining"
     _device_class = DEVICE_CLASS_BATTERY
-    _unit = UNIT_PERCENTAGE
+    _unit = PERCENTAGE
 
     @staticmethod
     def formatter(value):
@@ -176,10 +180,12 @@ class Battery(Sensor):
     async def async_state_attr_provider(self):
         """Return device state attrs for battery sensors."""
         state_attrs = {}
-        battery_size = await self._channel.get_attribute_value("battery_size")
+        attributes = ["battery_size", "battery_quantity"]
+        results = await self._channel.get_attributes(attributes)
+        battery_size = results.get("battery_size")
         if battery_size is not None:
             state_attrs["battery_size"] = BATTERY_SIZES.get(battery_size, "Unknown")
-        battery_quantity = await self._channel.get_attribute_value("battery_quantity")
+        battery_quantity = results.get("battery_quantity")
         if battery_quantity is not None:
             state_attrs["battery_quantity"] = battery_quantity
         return state_attrs
@@ -189,13 +195,14 @@ class Battery(Sensor):
         """Update a single device state attribute."""
         if key == "battery_voltage":
             self._device_state_attributes[key] = round(value / 10, 1)
-            self.async_schedule_update_ha_state()
+            self.async_write_ha_state()
 
 
 @STRICT_MATCH(channel_names=CHANNEL_ELECTRICAL_MEASUREMENT)
 class ElectricalMeasurement(Sensor):
     """Active power measurement."""
 
+    SENSOR_ATTR = "active_power"
     _device_class = DEVICE_CLASS_POWER
     _divisor = 10
     _unit = POWER_WATT
@@ -212,17 +219,11 @@ class ElectricalMeasurement(Sensor):
             return round(value, self._decimals)
         return round(value)
 
-
-@STRICT_MATCH(channel_names=CHANNEL_MULTISTATE_INPUT)
-class Text(Sensor):
-    """Sensor that displays string values."""
-
-    _device_class = None
-    _unit = None
-
-    def formatter(self, value) -> str:
-        """Return string value."""
-        return value
+    async def async_update(self) -> None:
+        """Retrieve latest state."""
+        if not self.available:
+            return
+        await super().async_update()
 
 
 @STRICT_MATCH(generic_ids=CHANNEL_ST_HUMIDITY_CLUSTER)
@@ -230,17 +231,19 @@ class Text(Sensor):
 class Humidity(Sensor):
     """Humidity sensor."""
 
+    SENSOR_ATTR = "measured_value"
     _device_class = DEVICE_CLASS_HUMIDITY
     _divisor = 100
-    _unit = UNIT_PERCENTAGE
+    _unit = PERCENTAGE
 
 
 @STRICT_MATCH(channel_names=CHANNEL_ILLUMINANCE)
 class Illuminance(Sensor):
     """Illuminance Sensor."""
 
+    SENSOR_ATTR = "measured_value"
     _device_class = DEVICE_CLASS_ILLUMINANCE
-    _unit = "lx"
+    _unit = LIGHT_LUX
 
     @staticmethod
     def formatter(value):
@@ -252,6 +255,7 @@ class Illuminance(Sensor):
 class SmartEnergyMetering(Sensor):
     """Metering sensor."""
 
+    SENSOR_ATTR = "instantaneous_demand"
     _device_class = DEVICE_CLASS_POWER
 
     def formatter(self, value):
@@ -268,15 +272,17 @@ class SmartEnergyMetering(Sensor):
 class Pressure(Sensor):
     """Pressure sensor."""
 
+    SENSOR_ATTR = "measured_value"
     _device_class = DEVICE_CLASS_PRESSURE
     _decimals = 0
-    _unit = "hPa"
+    _unit = PRESSURE_HPA
 
 
 @STRICT_MATCH(channel_names=CHANNEL_TEMPERATURE)
 class Temperature(Sensor):
     """Temperature Sensor."""
 
+    SENSOR_ATTR = "measured_value"
     _device_class = DEVICE_CLASS_TEMPERATURE
     _divisor = 100
     _unit = TEMP_CELSIUS
