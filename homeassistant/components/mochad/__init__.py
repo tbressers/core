@@ -1,9 +1,10 @@
 """Support for CM15A/CM19A X10 Controller using mochad daemon."""
+
 import logging
 import threading
 
+import probatio
 from pymochad import controller, exceptions
-import voluptuous as vol
 
 from homeassistant.const import (
     CONF_HOST,
@@ -11,11 +12,11 @@ from homeassistant.const import (
     EVENT_HOMEASSISTANT_START,
     EVENT_HOMEASSISTANT_STOP,
 )
-import homeassistant.helpers.config_validation as cv
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.typing import ConfigType
 
 _LOGGER = logging.getLogger(__name__)
-
-CONTROLLER = None
 
 CONF_COMM_TYPE = "comm_type"
 
@@ -23,41 +24,41 @@ DOMAIN = "mochad"
 
 REQ_LOCK = threading.Lock()
 
-CONFIG_SCHEMA = vol.Schema(
+CONFIG_SCHEMA = probatio.Schema(
     {
-        DOMAIN: vol.Schema(
+        DOMAIN: probatio.Schema(
             {
-                vol.Optional(CONF_HOST, default="localhost"): cv.string,
-                vol.Optional(CONF_PORT, default=1099): cv.port,
+                probatio.Optional(CONF_HOST, default="localhost"): cv.string,
+                probatio.Optional(CONF_PORT, default=1099): probatio.Port(),
             }
         )
     },
-    extra=vol.ALLOW_EXTRA,
+    extra=probatio.ALLOW_EXTRA,
 )
 
 
-def setup(hass, config):
+def setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the mochad component."""
     conf = config[DOMAIN]
     host = conf.get(CONF_HOST)
     port = conf.get(CONF_PORT)
 
-    global CONTROLLER
     try:
-        CONTROLLER = MochadCtrl(host, port)
+        mochad_controller = MochadCtrl(host, port)
     except exceptions.ConfigurationError:
-        _LOGGER.exception()
+        _LOGGER.exception("Unexpected exception")
         return False
 
     def stop_mochad(event):
         """Stop the Mochad service."""
-        CONTROLLER.disconnect()
+        mochad_controller.disconnect()
 
     def start_mochad(event):
         """Start the Mochad service."""
         hass.bus.listen_once(EVENT_HOMEASSISTANT_STOP, stop_mochad)
 
     hass.bus.listen_once(EVENT_HOMEASSISTANT_START, start_mochad)
+    hass.data[DOMAIN] = mochad_controller
 
     return True
 

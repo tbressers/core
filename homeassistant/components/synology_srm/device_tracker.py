@@ -1,12 +1,14 @@
 """Device tracker for Synology SRM routers."""
-import logging
 
+import logging
+from typing import override
+
+import probatio
 import synology_srm
-import voluptuous as vol
 
 from homeassistant.components.device_tracker import (
-    DOMAIN,
-    PLATFORM_SCHEMA,
+    DOMAIN as DEVICE_TRACKER_DOMAIN,
+    PLATFORM_SCHEMA as DEVICE_TRACKER_PLATFORM_SCHEMA,
     DeviceScanner,
 )
 from homeassistant.const import (
@@ -17,7 +19,9 @@ from homeassistant.const import (
     CONF_USERNAME,
     CONF_VERIFY_SSL,
 )
-import homeassistant.helpers.config_validation as cv
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.typing import ConfigType
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -26,27 +30,57 @@ DEFAULT_PORT = 8001
 DEFAULT_SSL = True
 DEFAULT_VERIFY_SSL = False
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = DEVICE_TRACKER_PLATFORM_SCHEMA.extend(
     {
-        vol.Required(CONF_HOST): cv.string,
-        vol.Required(CONF_USERNAME, default=DEFAULT_USERNAME): cv.string,
-        vol.Required(CONF_PASSWORD): cv.string,
-        vol.Optional(CONF_PORT, default=DEFAULT_PORT): cv.port,
-        vol.Optional(CONF_SSL, default=DEFAULT_SSL): cv.boolean,
-        vol.Optional(CONF_VERIFY_SSL, default=DEFAULT_VERIFY_SSL): cv.boolean,
+        probatio.Required(CONF_HOST): cv.string,
+        probatio.Required(CONF_USERNAME, default=DEFAULT_USERNAME): cv.string,
+        probatio.Required(probatio.Secret(CONF_PASSWORD)): cv.string,
+        probatio.Optional(CONF_PORT, default=DEFAULT_PORT): probatio.Port(),
+        probatio.Optional(CONF_SSL, default=DEFAULT_SSL): cv.boolean,
+        probatio.Optional(CONF_VERIFY_SSL, default=DEFAULT_VERIFY_SSL): cv.boolean,
     }
 )
 
+ATTRIBUTE_ALIAS = {
+    "band": None,
+    "connection": None,
+    "current_rate": None,
+    "dev_type": None,
+    "hostname": None,
+    "ip6_addr": None,
+    "ip_addr": None,
+    "is_baned": "is_banned",
+    "is_beamforming_on": None,
+    "is_guest": None,
+    "is_high_qos": None,
+    "is_low_qos": None,
+    "is_manual_dev_type": None,
+    "is_manual_hostname": None,
+    "is_online": None,
+    "is_parental_controled": "is_parental_controlled",
+    "is_qos": None,
+    "is_wireless": None,
+    "mac": None,
+    "max_rate": None,
+    "mesh_node_id": None,
+    "rate_quality": None,
+    "signalstrength": "signal_strength",
+    "transferRXRate": "transfer_rx_rate",
+    "transferTXRate": "transfer_tx_rate",
+}
 
-def get_scanner(hass, config):
+
+def get_scanner(
+    hass: HomeAssistant, config: ConfigType
+) -> SynologySrmDeviceScanner | None:
     """Validate the configuration and return Synology SRM scanner."""
-    scanner = SynologySrmDeviceScanner(config[DOMAIN])
+    scanner = SynologySrmDeviceScanner(config[DEVICE_TRACKER_DOMAIN])
 
     return scanner if scanner.success_init else None
 
 
 class SynologySrmDeviceScanner(DeviceScanner):
-    """This class scans for devices connected to a Synology SRM router."""
+    """Scanner for devices connected to a Synology SRM router."""
 
     def __init__(self, config):
         """Initialize the scanner."""
@@ -62,23 +96,37 @@ class SynologySrmDeviceScanner(DeviceScanner):
         if not config[CONF_VERIFY_SSL]:
             self.client.http.disable_https_verify()
 
-        self.last_results = []
+        self.devices = []
         self.success_init = self._update_info()
 
-        _LOGGER.info("Synology SRM scanner initialized")
-
+    @override
     def scan_devices(self):
         """Scan for new devices and return a list with found device IDs."""
         self._update_info()
 
-        return [device["mac"] for device in self.last_results]
+        return [device["mac"] for device in self.devices]
 
+    @override
+    def get_extra_attributes(self, device) -> dict:
+        """Get the extra attributes of a device."""
+        device = next(
+            (result for result in self.devices if result["mac"] == device), None
+        )
+        filtered_attributes: dict[str, str] = {}
+        if not device:
+            return filtered_attributes
+        for attribute, alias in ATTRIBUTE_ALIAS.items():
+            if (value := device.get(attribute)) is None:
+                continue
+            attr = alias or attribute
+            filtered_attributes[attr] = value
+        return filtered_attributes
+
+    @override
     def get_device_name(self, device):
         """Return the name of the given device or None if we don't know."""
         filter_named = [
-            result["hostname"]
-            for result in self.last_results
-            if result["mac"] == device
+            result["hostname"] for result in self.devices if result["mac"] == device
         ]
 
         if filter_named:
@@ -90,13 +138,12 @@ class SynologySrmDeviceScanner(DeviceScanner):
         """Check the router for connected devices."""
         _LOGGER.debug("Scanning for connected devices")
 
-        devices = self.client.core.network_nsm_device({"is_online": True})
-        last_results = []
+        try:
+            self.devices = self.client.core.get_network_nsm_device({"is_online": True})
+        except synology_srm.http.SynologyException as ex:
+            _LOGGER.error("Error with the Synology SRM: %s", ex)
+            return False
 
-        for device in devices:
-            last_results.append({"mac": device["mac"], "hostname": device["hostname"]})
+        _LOGGER.debug("Found %d device(s) connected to the router", len(self.devices))
 
-        _LOGGER.debug("Found %d device(s) connected to the router", len(devices))
-
-        self.last_results = last_results
         return True

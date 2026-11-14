@@ -1,114 +1,108 @@
-"""The tests for the ASUSWRT device tracker platform."""
-from unittest.mock import patch
+"""Tests for the AsusWrt device tracker."""
 
-from homeassistant.components.asuswrt import (
-    CONF_DNSMASQ,
-    CONF_INTERFACE,
-    DATA_ASUSWRT,
-    DOMAIN,
-)
-from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
-from homeassistant.setup import async_setup_component
+from aioasuswrt.asuswrt import Device as LegacyDevice
+import pytest
+from pytest_homeassistant.common import MockConfigEntry
 
-from tests.common import mock_coro_func
+from homeassistant.components import device_tracker
+from homeassistant.components.asuswrt.const import CONF_TRACK_UNKNOWN, DOMAIN
+from homeassistant.const import CONF_PROTOCOL
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr, entity_registry as er
+
+from .common import CONFIG_DATA_TELNET, MOCK_MACS, ROUTER_MAC_ADDR, new_device
 
 
-async def test_password_or_pub_key_required(hass):
-    """Test creating an AsusWRT scanner without a pass or pubkey."""
-    with patch("homeassistant.components.asuswrt.AsusWrt") as AsusWrt:
-        AsusWrt().connection.async_connect = mock_coro_func()
-        AsusWrt().is_connected = False
-        result = await async_setup_component(
-            hass,
-            DOMAIN,
-            {DOMAIN: {CONF_HOST: "fake_host", CONF_USERNAME: "fake_user"}},
+@pytest.mark.usefixtures("connect_legacy")
+async def test_unnamed_client_device_name(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+) -> None:
+    """Test an unnamed client only names a new device by its MAC address."""
+    config_entry = MockConfigEntry(
+        domain=DOMAIN, data=CONFIG_DATA_TELNET, unique_id=ROUTER_MAC_ADDR
+    )
+    config_entry.add_to_hass(hass)
+    existing_mac = dr.format_mac(MOCK_MACS[2])
+    new_mac = dr.format_mac(MOCK_MACS[3])
+    # Offline clients restored from registry entries without a name
+    entity_registry.async_get_or_create(
+        device_tracker.DOMAIN,
+        DOMAIN,
+        existing_mac,
+        config_entry=config_entry,
+        original_name=existing_mac.replace(":", "_"),
+    )
+    entity_registry.async_get_or_create(
+        device_tracker.DOMAIN, DOMAIN, new_mac, config_entry=config_entry
+    )
+    device_registry.async_get_or_create(
+        config_entry_id=config_entry.entry_id,
+        connections={(dr.CONNECTION_NETWORK_MAC, existing_mac)},
+        name="My phone",
+    )
+
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    existing_device = device_registry.async_get_device_by_connection(
+        (dr.CONNECTION_NETWORK_MAC, existing_mac), config_entry.entry_id
+    )
+    assert existing_device is not None
+    assert existing_device.name == "My phone"
+    new_device = device_registry.async_get_device_by_connection(
+        (dr.CONNECTION_NETWORK_MAC, new_mac), config_entry.entry_id
+    )
+    assert new_device is not None
+    assert new_device.name == new_mac
+
+
+@pytest.mark.usefixtures("connect_legacy")
+async def test_connected_unnamed_client_device_name(
+    hass: HomeAssistant,
+    device_registry: dr.DeviceRegistry,
+    entity_registry: er.EntityRegistry,
+    mock_devices_legacy: dict[str, LegacyDevice],
+) -> None:
+    """Test a connected unnamed client only names a new device by its MAC address."""
+    config_entry = MockConfigEntry(
+        domain=DOMAIN,
+        data=CONFIG_DATA_TELNET,
+        options={CONF_TRACK_UNKNOWN: True},
+        unique_id=ROUTER_MAC_ADDR,
+    )
+    config_entry.add_to_hass(hass)
+    existing_mac = dr.format_mac(MOCK_MACS[2])
+    new_mac = dr.format_mac(MOCK_MACS[3])
+    for mac, ip in ((MOCK_MACS[2], "192.168.1.4"), (MOCK_MACS[3], "192.168.1.5")):
+        mock_devices_legacy[mac] = new_device(
+            CONFIG_DATA_TELNET[CONF_PROTOCOL], mac, ip, None
         )
-        assert not result
+    device_registry.async_get_or_create(
+        config_entry_id=config_entry.entry_id,
+        connections={(dr.CONNECTION_NETWORK_MAC, existing_mac)},
+        name="My phone",
+    )
 
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
 
-async def test_get_scanner_with_password_no_pubkey(hass):
-    """Test creating an AsusWRT scanner with a password and no pubkey."""
-    with patch("homeassistant.components.asuswrt.AsusWrt") as AsusWrt:
-        AsusWrt().connection.async_connect = mock_coro_func()
-        AsusWrt().connection.async_get_connected_devices = mock_coro_func(
-            return_value={}
-        )
-        result = await async_setup_component(
-            hass,
-            DOMAIN,
-            {
-                DOMAIN: {
-                    CONF_HOST: "fake_host",
-                    CONF_USERNAME: "fake_user",
-                    CONF_PASSWORD: "4321",
-                    CONF_DNSMASQ: "/",
-                }
-            },
-        )
-        assert result
-        assert hass.data[DATA_ASUSWRT] is not None
-
-
-async def test_specify_non_directory_path_for_dnsmasq(hass):
-    """Test creating an AsusWRT scanner with a dnsmasq location which is not a valid directory."""
-    with patch("homeassistant.components.asuswrt.AsusWrt") as AsusWrt:
-        AsusWrt().connection.async_connect = mock_coro_func()
-        AsusWrt().is_connected = False
-        result = await async_setup_component(
-            hass,
-            DOMAIN,
-            {
-                DOMAIN: {
-                    CONF_HOST: "fake_host",
-                    CONF_USERNAME: "fake_user",
-                    CONF_PASSWORD: "4321",
-                    CONF_DNSMASQ: "?non_directory?",
-                }
-            },
-        )
-        assert not result
-
-
-async def test_interface(hass):
-    """Test creating an AsusWRT scanner using interface eth1."""
-    with patch("homeassistant.components.asuswrt.AsusWrt") as AsusWrt:
-        AsusWrt().connection.async_connect = mock_coro_func()
-        AsusWrt().connection.async_get_connected_devices = mock_coro_func(
-            return_value={}
-        )
-        result = await async_setup_component(
-            hass,
-            DOMAIN,
-            {
-                DOMAIN: {
-                    CONF_HOST: "fake_host",
-                    CONF_USERNAME: "fake_user",
-                    CONF_PASSWORD: "4321",
-                    CONF_DNSMASQ: "/",
-                    CONF_INTERFACE: "eth1",
-                }
-            },
-        )
-        assert result
-        assert hass.data[DATA_ASUSWRT] is not None
-
-
-async def test_no_interface(hass):
-    """Test creating an AsusWRT scanner using no interface."""
-    with patch("homeassistant.components.asuswrt.AsusWrt") as AsusWrt:
-        AsusWrt().connection.async_connect = mock_coro_func()
-        AsusWrt().is_connected = False
-        result = await async_setup_component(
-            hass,
-            DOMAIN,
-            {
-                DOMAIN: {
-                    CONF_HOST: "fake_host",
-                    CONF_USERNAME: "fake_user",
-                    CONF_PASSWORD: "4321",
-                    CONF_DNSMASQ: "/",
-                    CONF_INTERFACE: None,
-                }
-            },
-        )
-        assert not result
+    existing_device = device_registry.async_get_device_by_connection(
+        (dr.CONNECTION_NETWORK_MAC, existing_mac), config_entry.entry_id
+    )
+    assert existing_device is not None
+    assert existing_device.name == "My phone"
+    new_device_entry = device_registry.async_get_device_by_connection(
+        (dr.CONNECTION_NETWORK_MAC, new_mac), config_entry.entry_id
+    )
+    assert new_device_entry is not None
+    assert new_device_entry.name == new_mac
+    # The tracker of an unnamed client keeps its legacy name
+    entity_id = entity_registry.async_get_entity_id(
+        device_tracker.DOMAIN, DOMAIN, new_mac
+    )
+    assert entity_id is not None
+    entity_entry = entity_registry.async_get(entity_id)
+    assert entity_entry is not None
+    assert entity_entry.original_name == new_mac.replace(":", "_")

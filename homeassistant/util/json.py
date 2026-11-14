@@ -1,121 +1,130 @@
 """JSON utility functions."""
-from collections import deque
-import json
+
 import logging
-import os
-import tempfile
-from typing import Any, Dict, List, Optional, Type, Union
+from os import PathLike
+from typing import Any
+
+import orjson
+from typing_extensions import Sentinel as sentinel
 
 from homeassistant.exceptions import HomeAssistantError
 
+_SENTINEL = sentinel("_SENTINEL")
 _LOGGER = logging.getLogger(__name__)
+
+type JsonValueType = (
+    dict[str, JsonValueType] | list[JsonValueType] | str | int | float | bool | None
+)
+"""Any data that can be returned by the standard JSON deserializing process."""
+type JsonArrayType = list[JsonValueType]
+"""List that can be returned by the standard JSON deserializing process."""
+type JsonObjectType = dict[str, JsonValueType]
+"""Dictionary that can be returned by the standard JSON deserializing process."""
+
+JSON_ENCODE_EXCEPTIONS = (TypeError, ValueError)
+JSON_DECODE_EXCEPTIONS = (orjson.JSONDecodeError,)
 
 
 class SerializationError(HomeAssistantError):
     """Error serializing the data to JSON."""
 
 
-class WriteError(HomeAssistantError):
-    """Error writing the data."""
+def json_loads(obj: bytes | bytearray | memoryview | str, /) -> JsonValueType:
+    """Parse JSON data.
+
+    This adds a workaround for orjson not handling subclasses of str,
+    https://github.com/ijl/orjson/issues/445.
+    """
+    # Avoid isinstance overhead for the common case
+    if type(obj) not in (bytes, bytearray, memoryview, str) and isinstance(obj, str):
+        return orjson.loads(str(obj))  # type:ignore[no-any-return]
+    return orjson.loads(obj)  # type:ignore[no-any-return]
+
+
+def json_loads_array(obj: bytes | bytearray | memoryview | str, /) -> JsonArrayType:
+    """Parse JSON data and ensure result is a list."""
+    value: JsonValueType = json_loads(obj)
+    # Avoid isinstance overhead as we are not interested in list subclasses
+    if type(value) is list:
+        return value
+    raise ValueError(f"Expected JSON to be parsed as a list got {type(value)}")
+
+
+def json_loads_object(obj: bytes | bytearray | memoryview | str, /) -> JsonObjectType:
+    """Parse JSON data and ensure result is a dictionary."""
+    value: JsonValueType = json_loads(obj)
+    # Avoid isinstance overhead as we are not interested in dict subclasses
+    if type(value) is dict:
+        return value
+    raise ValueError(f"Expected JSON to be parsed as a dict got {type(value)}")
 
 
 def load_json(
-    filename: str, default: Union[List, Dict, None] = None
-) -> Union[List, Dict]:
-    """Load JSON data from a file and return as dict or list.
+    filename: str | PathLike[str],
+    default: JsonValueType | _SENTINEL = _SENTINEL,
+) -> JsonValueType:
+    """Load JSON data from a file.
 
     Defaults to returning empty dict if file is not found.
     """
     try:
-        with open(filename, encoding="utf-8") as fdesc:
-            return json.loads(fdesc.read())  # type: ignore
+        with open(filename, mode="rb") as fdesc:
+            return orjson.loads(fdesc.read())  # type: ignore[no-any-return]
     except FileNotFoundError:
         # This is not a fatal error
         _LOGGER.debug("JSON file not found: %s", filename)
-    except ValueError as error:
+    except JSON_DECODE_EXCEPTIONS as error:
         _LOGGER.exception("Could not parse JSON content: %s", filename)
-        raise HomeAssistantError(error)
+        raise HomeAssistantError(f"Error while loading {filename}: {error}") from error
     except OSError as error:
         _LOGGER.exception("JSON file reading failed: %s", filename)
-        raise HomeAssistantError(error)
-    return {} if default is None else default
+        raise HomeAssistantError(f"Error while loading {filename}: {error}") from error
+    return {} if default is _SENTINEL else default
 
 
-def save_json(
-    filename: str,
-    data: Union[List, Dict],
-    private: bool = False,
-    *,
-    encoder: Optional[Type[json.JSONEncoder]] = None,
-) -> None:
-    """Save JSON data to a file.
+def load_json_array(
+    filename: str | PathLike[str],
+    default: JsonArrayType | _SENTINEL = _SENTINEL,
+) -> JsonArrayType:
+    """Load JSON data from a file and return as list.
 
-    Returns True on success.
+    Defaults to returning empty list if file is not found.
     """
-    try:
-        json_data = json.dumps(data, sort_keys=True, indent=4, cls=encoder)
-    except TypeError:
-        # pylint: disable=no-member
-        msg = f"Failed to serialize to JSON: {filename}. Bad data found at {', '.join(find_paths_unserializable_data(data))}"
-        _LOGGER.error(msg)
-        raise SerializationError(msg)
-
-    tmp_filename = ""
-    tmp_path = os.path.split(filename)[0]
-    try:
-        # Modern versions of Python tempfile create this file with mode 0o600
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=tmp_path, delete=False
-        ) as fdesc:
-            fdesc.write(json_data)
-            tmp_filename = fdesc.name
-        if not private:
-            os.chmod(tmp_filename, 0o644)
-        os.replace(tmp_filename, filename)
-    except OSError as error:
-        _LOGGER.exception("Saving JSON file failed: %s", filename)
-        raise WriteError(error)
-    finally:
-        if os.path.exists(tmp_filename):
-            try:
-                os.remove(tmp_filename)
-            except OSError as err:
-                # If we are cleaning up then something else went wrong, so
-                # we should suppress likely follow-on errors in the cleanup
-                _LOGGER.error("JSON replacement cleanup failed: %s", err)
+    if default is _SENTINEL:
+        default = []
+    value: JsonValueType = load_json(filename, default=default)
+    # Avoid isinstance overhead as we are not interested in list subclasses
+    if type(value) is list:
+        return value
+    _LOGGER.exception(
+        "Expected JSON to be parsed as a list got %s in: %s", {type(value)}, filename
+    )
+    raise HomeAssistantError(f"Expected JSON to be parsed as a list got {type(value)}")
 
 
-def find_paths_unserializable_data(bad_data: Any) -> List[str]:
-    """Find the paths to unserializable data.
+def load_json_object(
+    filename: str | PathLike[str],
+    default: JsonObjectType | _SENTINEL = _SENTINEL,
+) -> JsonObjectType:
+    """Load JSON data from a file and return as dict.
 
-    This method is slow! Only use for error handling.
+    Defaults to returning empty dict if file is not found.
     """
-    to_process = deque([(bad_data, "$")])
-    invalid = []
+    if default is _SENTINEL:
+        default = {}
+    value: JsonValueType = load_json(filename, default=default)
+    # Avoid isinstance overhead as we are not interested in dict subclasses
+    if type(value) is dict:
+        return value
+    _LOGGER.exception(
+        "Expected JSON to be parsed as a dict got %s in: %s", {type(value)}, filename
+    )
+    raise HomeAssistantError(f"Expected JSON to be parsed as a dict got {type(value)}")
 
-    while to_process:
-        obj, obj_path = to_process.popleft()
 
-        try:
-            json.dumps(obj)
-            continue
-        except TypeError:
-            pass
+def format_unserializable_data(data: dict[str, Any]) -> str:
+    """Format output of find_paths in a friendly way.
 
-        if isinstance(obj, dict):
-            for key, value in obj.items():
-                try:
-                    # Is key valid?
-                    json.dumps({key: None})
-                except TypeError:
-                    invalid.append(f"{obj_path}<key: {key}>")
-                else:
-                    # Process value
-                    to_process.append((value, f"{obj_path}.{key}"))
-        elif isinstance(obj, list):
-            for idx, value in enumerate(obj):
-                to_process.append((value, f"{obj_path}[{idx}]"))
-        else:
-            invalid.append(obj_path)
-
-    return invalid
+    Format is comma separated: <path>=<value>(<type>)
+    """
+    return ", ".join(f"{path}={value}({type(value)}" for path, value in data.items())

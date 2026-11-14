@@ -1,214 +1,131 @@
 """Support for WLED."""
+
 import asyncio
-from datetime import timedelta
 import logging
-from typing import Any, Dict, Optional, Union
+from typing import TYPE_CHECKING
 
-from wled import WLED, WLEDConnectionError, WLEDError
-
-from homeassistant.components.light import DOMAIN as LIGHT_DOMAIN
-from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN
-from homeassistant.components.switch import DOMAIN as SWITCH_DOMAIN
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import ATTR_NAME, CONF_HOST
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.dispatcher import (
-    async_dispatcher_connect,
-    async_dispatcher_send,
-)
-from homeassistant.helpers.entity import Entity
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.config_entries import SOURCE_IGNORE
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryError
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.typing import ConfigType
-from homeassistant.util import dt as dt_util
+from homeassistant.util.hass_dict import HassKey
 
-from .const import (
-    ATTR_IDENTIFIERS,
-    ATTR_MANUFACTURER,
-    ATTR_MODEL,
-    ATTR_SOFTWARE_VERSION,
-    DATA_WLED_CLIENT,
-    DATA_WLED_TIMER,
-    DATA_WLED_UPDATED,
-    DOMAIN,
+from .const import DOMAIN
+from .coordinator import (
+    WLEDConfigEntry,
+    WLEDDataUpdateCoordinator,
+    WLEDReleasesDataUpdateCoordinator,
+    normalize_mac_address,
 )
-
-SCAN_INTERVAL = timedelta(seconds=10)
-WLED_COMPONENTS = (LIGHT_DOMAIN, SENSOR_DOMAIN, SWITCH_DOMAIN)
 
 _LOGGER = logging.getLogger(__name__)
 
+PLATFORMS = (
+    Platform.BUTTON,
+    Platform.LIGHT,
+    Platform.NUMBER,
+    Platform.SELECT,
+    Platform.SENSOR,
+    Platform.SWITCH,
+    Platform.UPDATE,
+)
+
+WLED_KEY: HassKey[dict[str, WLEDReleasesDataUpdateCoordinator]] = HassKey(DOMAIN)
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Set up the WLED components."""
+    """Set up the WLED integration.
+
+    Releases are fetched by one coordinator per firmware repository, shared
+    across all WLED devices (and config entries) using it, to avoid fetching
+    the same data multiple times for each.
+    """
+    hass.data[WLED_KEY] = {}
     return True
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: WLEDConfigEntry) -> None:
     """Set up WLED from a config entry."""
-
-    # Create WLED instance for this entry
-    session = async_get_clientsession(hass)
-    wled = WLED(entry.data[CONF_HOST], session=session)
-
-    # Ensure we can connect and talk to it
-    try:
-        await wled.update()
-    except WLEDConnectionError as exception:
-        raise ConfigEntryNotReady from exception
-
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = {DATA_WLED_CLIENT: wled}
-
-    # For backwards compat, set unique ID
-    if entry.unique_id is None:
-        hass.config_entries.async_update_entry(
-            entry, unique_id=wled.device.info.mac_address
-        )
+    entry.runtime_data = WLEDDataUpdateCoordinator(hass, entry=entry)
+    await entry.runtime_data.async_config_entry_first_refresh()
 
     # Set up all platforms for this device/entry.
-    for component in WLED_COMPONENTS:
-        hass.async_create_task(
-            hass.config_entries.async_forward_entry_setup(entry, component)
-        )
-
-    async def interval_update(now: dt_util.dt.datetime = None) -> None:
-        """Poll WLED device function, dispatches event after update."""
-        try:
-            await wled.update()
-        except WLEDError:
-            _LOGGER.debug("An error occurred while updating WLED", exc_info=True)
-
-        # Even if the update failed, we still send out the event.
-        # To allow entities to make themselves unavailable.
-        async_dispatcher_send(hass, DATA_WLED_UPDATED, entry.entry_id)
-
-    # Schedule update interval
-    hass.data[DOMAIN][entry.entry_id][DATA_WLED_TIMER] = async_track_time_interval(
-        hass, interval_update, SCAN_INTERVAL
-    )
-
-    return True
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: WLEDConfigEntry) -> None:
     """Unload WLED config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
+    coordinator = entry.runtime_data
 
-    # Cancel update timer for this entry/device.
-    cancel_timer = hass.data[DOMAIN][entry.entry_id][DATA_WLED_TIMER]
-    cancel_timer()
+    # Ensure disconnected and cleanup stop sub. Cleared once called, as the
+    # WebSocket listener also cleans it up when the disconnect ends it.
+    await coordinator.wled.disconnect()
+    if coordinator.unsub:
+        coordinator.unsub()
+        coordinator.unsub = None
 
-    # Unload entities for this entry/device.
-    await asyncio.gather(
-        *(
-            hass.config_entries.async_forward_entry_unload(entry, component)
-            for component in WLED_COMPONENTS
-        )
+
+async def async_migrate_entry(
+    hass: HomeAssistant, config_entry: WLEDConfigEntry
+) -> None:
+    """Migrate old entry."""
+    _LOGGER.debug(
+        "Migrating configuration from version %s.%s",
+        config_entry.version,
+        config_entry.minor_version,
     )
 
-    # Cleanup
-    del hass.data[DOMAIN][entry.entry_id]
-    if not hass.data[DOMAIN]:
-        del hass.data[DOMAIN]
+    if config_entry.version == 1:
+        if config_entry.minor_version < 2:
+            # 1.2: Normalize unique ID to be lowercase MAC address without separators.
+            # This matches the format used by WLED firmware.
+            if TYPE_CHECKING:
+                assert config_entry.unique_id
+            normalized_mac_address = normalize_mac_address(config_entry.unique_id)
+            duplicate_entries = [
+                entry
+                for entry in hass.config_entries.async_entries(DOMAIN)
+                if entry.unique_id
+                and normalize_mac_address(entry.unique_id) == normalized_mac_address
+            ]
+            ignored_entries = [
+                entry
+                for entry in duplicate_entries
+                if entry.entry_id != config_entry.entry_id
+                and entry.source == SOURCE_IGNORE
+            ]
+            if ignored_entries:
+                _LOGGER.info(
+                    "Found %d ignored WLED config entries"
+                    " with the same MAC address, removing them",
+                    len(ignored_entries),
+                )
+                await asyncio.gather(
+                    *[
+                        hass.config_entries.async_remove(entry.entry_id)
+                        for entry in ignored_entries
+                    ]
+                )
+            if len(duplicate_entries) - len(ignored_entries) > 1:
+                raise ConfigEntryError(
+                    translation_domain=DOMAIN,
+                    translation_key="duplicate_mac_address",
+                    translation_placeholders={"mac_address": normalized_mac_address},
+                )
 
-    return True
+            hass.config_entries.async_update_entry(
+                config_entry,
+                unique_id=normalized_mac_address,
+                version=1,
+                minor_version=2,
+            )
 
-
-class WLEDEntity(Entity):
-    """Defines a base WLED entity."""
-
-    def __init__(
-        self,
-        entry_id: str,
-        wled: WLED,
-        name: str,
-        icon: str,
-        enabled_default: bool = True,
-    ) -> None:
-        """Initialize the WLED entity."""
-        self._attributes: Dict[str, Union[str, int, float]] = {}
-        self._available = True
-        self._enabled_default = enabled_default
-        self._entry_id = entry_id
-        self._icon = icon
-        self._name = name
-        self._unsub_dispatcher = None
-        self.wled = wled
-
-    @property
-    def name(self) -> str:
-        """Return the name of the entity."""
-        return self._name
-
-    @property
-    def icon(self) -> str:
-        """Return the mdi icon of the entity."""
-        return self._icon
-
-    @property
-    def available(self) -> bool:
-        """Return True if entity is available."""
-        return self._available
-
-    @property
-    def entity_registry_enabled_default(self) -> bool:
-        """Return if the entity should be enabled when first added to the entity registry."""
-        return self._enabled_default
-
-    @property
-    def should_poll(self) -> bool:
-        """Return the polling requirement of the entity."""
-        return False
-
-    @property
-    def device_state_attributes(self) -> Optional[Dict[str, Any]]:
-        """Return the state attributes of the entity."""
-        return self._attributes
-
-    async def async_added_to_hass(self) -> None:
-        """Connect to dispatcher listening for entity data notifications."""
-        self._unsub_dispatcher = async_dispatcher_connect(
-            self.hass, DATA_WLED_UPDATED, self._schedule_immediate_update
-        )
-
-    async def async_will_remove_from_hass(self) -> None:
-        """Disconnect from update signal."""
-        self._unsub_dispatcher()
-
-    @callback
-    def _schedule_immediate_update(self, entry_id: str) -> None:
-        """Schedule an immediate update of the entity."""
-        if entry_id == self._entry_id:
-            self.async_schedule_update_ha_state(True)
-
-    async def async_update(self) -> None:
-        """Update WLED entity."""
-        if not self.enabled:
-            return
-
-        if self.wled.device is None:
-            self._available = False
-            return
-
-        self._available = True
-        await self._wled_update()
-
-    async def _wled_update(self) -> None:
-        """Update WLED entity."""
-        raise NotImplementedError()
-
-
-class WLEDDeviceEntity(WLEDEntity):
-    """Defines a WLED device entity."""
-
-    @property
-    def device_info(self) -> Dict[str, Any]:
-        """Return device information about this WLED device."""
-        return {
-            ATTR_IDENTIFIERS: {(DOMAIN, self.wled.device.info.mac_address)},
-            ATTR_NAME: self.wled.device.info.name,
-            ATTR_MANUFACTURER: self.wled.device.info.brand,
-            ATTR_MODEL: self.wled.device.info.product,
-            ATTR_SOFTWARE_VERSION: self.wled.device.info.version,
-        }
+    _LOGGER.debug(
+        "Migration to configuration version %s.%s successful",
+        config_entry.version,
+        config_entry.minor_version,
+    )

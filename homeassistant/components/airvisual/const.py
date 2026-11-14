@@ -1,14 +1,14 @@
 """Define AirVisual constants."""
-from datetime import timedelta
+
+import logging
 
 DOMAIN = "airvisual"
+LOGGER = logging.getLogger(__package__)
+
+INTEGRATION_TYPE_GEOGRAPHY_COORDS = "Geographical Location by Latitude/Longitude"
+INTEGRATION_TYPE_GEOGRAPHY_NAME = "Geographical Location by Name"
+INTEGRATION_TYPE_NODE_PRO = "AirVisual Node/Pro"
 
 CONF_CITY = "city"
-CONF_COUNTRY = "country"
 CONF_GEOGRAPHIES = "geographies"
-
-DATA_CLIENT = "client"
-
-DEFAULT_SCAN_INTERVAL = timedelta(minutes=10)
-
-TOPIC_UPDATE = f"{DOMAIN}_update"
+CONF_INTEGRATION_TYPE = "integration_type"

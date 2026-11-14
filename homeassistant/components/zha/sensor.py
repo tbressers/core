@@ -1,293 +1,169 @@
 """Sensors on Zigbee Home Automation networks."""
+
+from collections.abc import Mapping
 import functools
 import logging
-import numbers
+from typing import Any, override
 
 from homeassistant.components.sensor import (
-    DEVICE_CLASS_BATTERY,
-    DEVICE_CLASS_HUMIDITY,
-    DEVICE_CLASS_ILLUMINANCE,
-    DEVICE_CLASS_POWER,
-    DEVICE_CLASS_PRESSURE,
-    DEVICE_CLASS_TEMPERATURE,
-    DOMAIN,
+    SensorDeviceClass,
+    SensorEntity,
+    SensorStateClass,
 )
-from homeassistant.const import (
-    ATTR_UNIT_OF_MEASUREMENT,
-    POWER_WATT,
-    STATE_UNKNOWN,
-    TEMP_CELSIUS,
-    UNIT_PERCENTAGE,
-)
-from homeassistant.core import callback
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from homeassistant.util.temperature import fahrenheit_to_celsius
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.typing import StateType
 
-from .core import discovery
-from .core.const import (
-    CHANNEL_ANALOG_INPUT,
-    CHANNEL_ELECTRICAL_MEASUREMENT,
-    CHANNEL_HUMIDITY,
-    CHANNEL_ILLUMINANCE,
-    CHANNEL_MULTISTATE_INPUT,
-    CHANNEL_POWER_CONFIGURATION,
-    CHANNEL_PRESSURE,
-    CHANNEL_SMARTENERGY_METERING,
-    CHANNEL_TEMPERATURE,
-    DATA_ZHA,
-    DATA_ZHA_DISPATCHERS,
+from .entity import ZHAEntity
+from .helpers import (
     SIGNAL_ADD_ENTITIES,
-    SIGNAL_ATTR_UPDATED,
-    SIGNAL_STATE_ATTR,
+    EntityData,
+    async_add_entities as zha_async_add_entities,
+    exclude_none_values,
+    get_zha_data,
 )
-from .core.registries import SMARTTHINGS_HUMIDITY_CLUSTER, ZHA_ENTITIES
-from .entity import ZhaEntity
 
-PARALLEL_UPDATES = 5
 _LOGGER = logging.getLogger(__name__)
 
-BATTERY_SIZES = {
-    0: "No battery",
-    1: "Built in",
-    2: "Other",
-    3: "AA",
-    4: "AAA",
-    5: "C",
-    6: "D",
-    7: "CR2",
-    8: "CR123A",
-    9: "CR2450",
-    10: "CR2032",
-    11: "CR1632",
-    255: "Unknown",
+# For backwards compatibility and transparency, all expected extra state attributes are
+# explicitly listed below. These should have been sensors themselves but for whatever
+# reason were not created as such. They will be migrated to independent sensor entities
+# in a future release.
+_EXTRA_STATE_ATTRIBUTES: set[str] = {
+    # Battery
+    "battery_size",
+    "battery_quantity",
+    "battery_voltage",
+    # Power
+    "measurement_type",
+    "apparent_power_max",
+    "rms_current_max",
+    "rms_current_max_ph_b",
+    "rms_current_max_ph_c",
+    "rms_voltage_max",
+    "rms_voltage_max_ph_b",
+    "rms_voltage_max_ph_c",
+    "ac_frequency_max",
+    "power_factor_max",
+    "power_factor_max_ph_b",
+    "power_factor_max_ph_c",
+    "active_power_max",
+    "active_power_max_ph_b",
+    "active_power_max_ph_c",
+    # Smart Energy metering
+    "device_type",
+    "status",
+    "zcl_unit_of_measurement",
+    # Danfoss bitmaps
+    "In_progress",
+    "Valve_characteristic_found",
+    "Valve_characteristic_lost",
+    "Top_pcb_sensor_error",
+    "Side_pcb_sensor_error",
+    "Non_volatile_memory_error",
+    "Unknown_hw_error",
+    "Motor_error",
+    "Invalid_internal_communication",
+    "Invalid_clock_information",
+    "Radio_communication_error",
+    "Encoder_jammed",
+    "Low_battery",
+    "Critical_low_battery",
 }
 
-CHANNEL_ST_HUMIDITY_CLUSTER = f"channel_0x{SMARTTHINGS_HUMIDITY_CLUSTER:04x}"
-STRICT_MATCH = functools.partial(ZHA_ENTITIES.strict_match, DOMAIN)
 
-
-async def async_setup_entry(hass, config_entry, async_add_entities):
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
     """Set up the Zigbee Home Automation sensor from config entry."""
-    entities_to_create = hass.data[DATA_ZHA][DOMAIN] = []
+    zha_data = get_zha_data(hass)
+    entities_to_create = zha_data.platforms[Platform.SENSOR]
 
     unsub = async_dispatcher_connect(
         hass,
         SIGNAL_ADD_ENTITIES,
         functools.partial(
-            discovery.async_add_entities, async_add_entities, entities_to_create
+            zha_async_add_entities, async_add_entities, Sensor, entities_to_create
         ),
     )
-    hass.data[DATA_ZHA][DATA_ZHA_DISPATCHERS].append(unsub)
+    config_entry.async_on_unload(unsub)
 
 
-class Sensor(ZhaEntity):
-    """Base ZHA sensor."""
+# pylint: disable-next=home-assistant-invalid-inheritance # needs fixing
+class Sensor(ZHAEntity, SensorEntity):
+    """ZHA sensor."""
 
-    _decimals = 1
-    _device_class = None
-    _divisor = 1
-    _multiplier = 1
-    _unit = None
+    def __init__(self, entity_data: EntityData, **kwargs: Any) -> None:
+        """Initialize the ZHA select entity."""
+        super().__init__(entity_data, **kwargs)
+        entity = self.entity_data.entity
 
-    def __init__(self, unique_id, zha_device, channels, **kwargs):
-        """Init this sensor."""
-        super().__init__(unique_id, zha_device, channels, **kwargs)
-        self._channel = channels[0]
+        if self._zha_state.device_class is not None:
+            self._attr_device_class = SensorDeviceClass(self._zha_state.device_class)
 
-    async def async_added_to_hass(self):
-        """Run when about to be added to hass."""
-        await super().async_added_to_hass()
-        self._device_state_attributes.update(await self.async_state_attr_provider())
+        if self._zha_state.state_class is not None:
+            self._attr_state_class = SensorStateClass(self._zha_state.state_class)
 
-        await self.async_accept_signal(
-            self._channel, SIGNAL_ATTR_UPDATED, self.async_set_state
-        )
-        await self.async_accept_signal(
-            self._channel, SIGNAL_STATE_ATTR, self.async_update_state_attribute
-        )
+        if hasattr(self._zha_state, "unit") and self._zha_state.unit is not None:
+            self._attr_native_unit_of_measurement = self._zha_state.unit
 
-    @property
-    def device_class(self) -> str:
-        """Return device class from component DEVICE_CLASSES."""
-        return self._device_class
+        if (
+            hasattr(entity, "entity_description")
+            and entity.entity_description is not None
+        ):
+            entity_description = entity.entity_description
 
-    @property
-    def unit_of_measurement(self):
-        """Return the unit of measurement of this entity."""
-        return self._unit
+            if entity_description.state_class is not None:
+                self._attr_state_class = SensorStateClass(
+                    entity_description.state_class.value
+                )
 
-    @property
-    def state(self) -> str:
-        """Return the state of the entity."""
-        if self._state is None:
-            return None
-        return self._state
+            if entity_description.scale is not None:
+                self._attr_scale = entity_description.scale
 
-    @callback
-    def async_set_state(self, state):
-        """Handle state update from channel."""
-        if state is not None:
-            state = self.formatter(state)
-        self._state = state
-        self.async_schedule_update_ha_state()
+            if entity_description.native_unit_of_measurement is not None:
+                self._attr_native_unit_of_measurement = (
+                    entity_description.native_unit_of_measurement
+                )
 
-    @callback
-    def async_restore_last_state(self, last_state):
-        """Restore previous state."""
-        self._state = last_state.state
+            if entity_description.device_class is not None:
+                self._attr_device_class = SensorDeviceClass(
+                    entity_description.device_class.value
+                )
 
-    @callback
-    async def async_state_attr_provider(self):
-        """Initialize device state attributes."""
-        return {}
-
-    def formatter(self, value):
-        """Numeric pass-through formatter."""
-        if self._decimals > 0:
-            return round(
-                float(value * self._multiplier) / self._divisor, self._decimals
+        if self._zha_state.suggested_display_precision is not None:
+            self._attr_suggested_display_precision = (
+                self._zha_state.suggested_display_precision
             )
-        return round(float(value * self._multiplier) / self._divisor)
 
+        if hasattr(self._zha_state, "options"):
+            self._attr_options = self._zha_state.options
 
-@STRICT_MATCH(channel_names=CHANNEL_ANALOG_INPUT)
-class AnalogInput(Sensor):
-    """Sensor that displays analog input values."""
-
-    pass
-
-
-@STRICT_MATCH(channel_names=CHANNEL_POWER_CONFIGURATION)
-class Battery(Sensor):
-    """Battery sensor of power configuration cluster."""
-
-    _device_class = DEVICE_CLASS_BATTERY
-    _unit = UNIT_PERCENTAGE
-
-    @staticmethod
-    def formatter(value):
+    @property
+    @override
+    def native_value(self) -> StateType:
         """Return the state of the entity."""
-        # per zcl specs battery percent is reported at 200% ¯\_(ツ)_/¯
-        if not isinstance(value, numbers.Number) or value == -1:
-            return value
-        value = round(value / 2)
-        return value
-
-    async def async_state_attr_provider(self):
-        """Return device state attrs for battery sensors."""
-        state_attrs = {}
-        battery_size = await self._channel.get_attribute_value("battery_size")
-        if battery_size is not None:
-            state_attrs["battery_size"] = BATTERY_SIZES.get(battery_size, "Unknown")
-        battery_quantity = await self._channel.get_attribute_value("battery_quantity")
-        if battery_quantity is not None:
-            state_attrs["battery_quantity"] = battery_quantity
-        return state_attrs
-
-    @callback
-    def async_update_state_attribute(self, key, value):
-        """Update a single device state attribute."""
-        if key == "battery_voltage":
-            self._device_state_attributes[key] = round(value / 10, 1)
-            self.async_schedule_update_ha_state()
-
-
-@STRICT_MATCH(channel_names=CHANNEL_ELECTRICAL_MEASUREMENT)
-class ElectricalMeasurement(Sensor):
-    """Active power measurement."""
-
-    _device_class = DEVICE_CLASS_POWER
-    _divisor = 10
-    _unit = POWER_WATT
+        return self._zha_state.native_value
 
     @property
-    def should_poll(self) -> bool:
-        """Return True if HA needs to poll for state changes."""
-        return True
+    @override
+    def extra_state_attributes(self) -> Mapping[str, Any] | None:
+        """Return entity specific state attributes."""
+        if not self._zha_state.extra_state_attribute_names:
+            return None
 
-    def formatter(self, value) -> int:
-        """Return 'normalized' value."""
-        value = value * self._channel.multiplier / self._channel.divisor
-        if value < 100 and self._channel.divisor > 1:
-            return round(value, self._decimals)
-        return round(value)
+        extra_state_attributes = self._zha_state.extra_state_attributes
 
+        if not extra_state_attributes.keys() <= _EXTRA_STATE_ATTRIBUTES:
+            _LOGGER.warning(
+                "Unexpected extra state attributes found for sensor %s: %s",
+                self.entity_data.entity,
+                extra_state_attributes.keys() - _EXTRA_STATE_ATTRIBUTES,
+            )
 
-@STRICT_MATCH(channel_names=CHANNEL_MULTISTATE_INPUT)
-class Text(Sensor):
-    """Sensor that displays string values."""
-
-    _device_class = None
-    _unit = None
-
-    def formatter(self, value) -> str:
-        """Return string value."""
-        return value
-
-
-@STRICT_MATCH(generic_ids=CHANNEL_ST_HUMIDITY_CLUSTER)
-@STRICT_MATCH(channel_names=CHANNEL_HUMIDITY)
-class Humidity(Sensor):
-    """Humidity sensor."""
-
-    _device_class = DEVICE_CLASS_HUMIDITY
-    _divisor = 100
-    _unit = UNIT_PERCENTAGE
-
-
-@STRICT_MATCH(channel_names=CHANNEL_ILLUMINANCE)
-class Illuminance(Sensor):
-    """Illuminance Sensor."""
-
-    _device_class = DEVICE_CLASS_ILLUMINANCE
-    _unit = "lx"
-
-    @staticmethod
-    def formatter(value):
-        """Convert illumination data."""
-        return round(pow(10, ((value - 1) / 10000)), 1)
-
-
-@STRICT_MATCH(channel_names=CHANNEL_SMARTENERGY_METERING)
-class SmartEnergyMetering(Sensor):
-    """Metering sensor."""
-
-    _device_class = DEVICE_CLASS_POWER
-
-    def formatter(self, value):
-        """Pass through channel formatter."""
-        return self._channel.formatter_function(value)
-
-    @property
-    def unit_of_measurement(self):
-        """Return Unit of measurement."""
-        return self._channel.unit_of_measurement
-
-
-@STRICT_MATCH(channel_names=CHANNEL_PRESSURE)
-class Pressure(Sensor):
-    """Pressure sensor."""
-
-    _device_class = DEVICE_CLASS_PRESSURE
-    _decimals = 0
-    _unit = "hPa"
-
-
-@STRICT_MATCH(channel_names=CHANNEL_TEMPERATURE)
-class Temperature(Sensor):
-    """Temperature Sensor."""
-
-    _device_class = DEVICE_CLASS_TEMPERATURE
-    _divisor = 100
-    _unit = TEMP_CELSIUS
-
-    @callback
-    def async_restore_last_state(self, last_state):
-        """Restore previous state."""
-        if last_state.state == STATE_UNKNOWN:
-            return
-        if last_state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) != TEMP_CELSIUS:
-            ftemp = float(last_state.state)
-            self._state = round(fahrenheit_to_celsius(ftemp), 1)
-            return
-        self._state = last_state.state
+        return exclude_none_values(extra_state_attributes)

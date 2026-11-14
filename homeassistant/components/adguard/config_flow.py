@@ -1,13 +1,18 @@
 """Config flow to configure the AdGuard Home integration."""
-from distutils.version import LooseVersion
-import logging
 
-from adguardhome import AdGuardHome, AdGuardHomeConnectionError
-import voluptuous as vol
+from collections.abc import Mapping
+from typing import Any, override
 
-from homeassistant import config_entries
-from homeassistant.components.adguard.const import DOMAIN, MIN_ADGUARD_HOME_VERSION
-from homeassistant.config_entries import ConfigFlow
+from adguardhome import (
+    AdGuardHome,
+    AdGuardHomeAuthenticationError,
+    AdGuardHomeConnectionError,
+    AdGuardHomeError,
+)
+import probatio
+from yarl import URL
+
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import (
     CONF_HOST,
     CONF_PASSWORD,
@@ -16,86 +21,107 @@ from homeassistant.const import (
     CONF_USERNAME,
     CONF_VERIFY_SSL,
 )
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.service_info.hassio import HassioServiceInfo
 
-_LOGGER = logging.getLogger(__name__)
+from .const import DOMAIN, LOGGER
+
+STEP_USER_DATA_SCHEMA = probatio.Schema(
+    {
+        probatio.Required(CONF_HOST): str,
+        probatio.Required(CONF_PORT, default=3000): probatio.Coerce(int),
+        probatio.Optional(CONF_USERNAME): str,
+        probatio.Optional(probatio.Secret(CONF_PASSWORD)): str,
+        probatio.Required(CONF_SSL, default=True): bool,
+        probatio.Required(CONF_VERIFY_SSL, default=True): bool,
+    }
+)
 
 
-@config_entries.HANDLERS.register(DOMAIN)
-class AdGuardHomeFlowHandler(ConfigFlow):
+async def _async_validate_connection(
+    hass: HomeAssistant,
+    *,
+    host: str,
+    port: int,
+    ssl: bool,
+    verify_ssl: bool,
+    username: str | None = None,
+    password: str | None = None,
+) -> str | None:
+    """Return the error connecting to AdGuard Home ends in, if any."""
+    adguard = AdGuardHome(
+        URL.build(scheme="https" if ssl else "http", host=host, port=port),
+        username=username,
+        password=password,
+        verify_ssl=verify_ssl,
+        session=async_get_clientsession(hass, verify_ssl),
+    )
+
+    try:
+        await adguard.status()
+    except AdGuardHomeConnectionError:
+        return "cannot_connect"
+    except AdGuardHomeAuthenticationError:
+        return "invalid_auth"
+    except AdGuardHomeError:
+        LOGGER.exception("Unexpected error connecting to AdGuard Home")
+        return "unknown"
+
+    return None
+
+
+class AdGuardHomeFlowHandler(ConfigFlow, domain=DOMAIN):
     """Handle a AdGuard Home config flow."""
 
     VERSION = 1
-    CONNECTION_CLASS = config_entries.CONN_CLASS_LOCAL_POLL
+    MINOR_VERSION = 2
 
-    _hassio_discovery = None
+    _hassio_discovery: dict[str, Any] | None = None
 
-    def __init__(self):
-        """Initialize AgGuard Home flow."""
-        pass
-
-    async def _show_setup_form(self, errors=None):
+    async def _show_setup_form(
+        self, errors: dict[str, str] | None = None
+    ) -> ConfigFlowResult:
         """Show the setup form to the user."""
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(CONF_HOST): str,
-                    vol.Required(CONF_PORT, default=3000): vol.Coerce(int),
-                    vol.Optional(CONF_USERNAME): str,
-                    vol.Optional(CONF_PASSWORD): str,
-                    vol.Required(CONF_SSL, default=True): bool,
-                    vol.Required(CONF_VERIFY_SSL, default=True): bool,
-                }
-            ),
+            data_schema=STEP_USER_DATA_SCHEMA,
             errors=errors or {},
         )
 
-    async def _show_hassio_form(self, errors=None):
+    async def _show_hassio_form(
+        self, errors: dict[str, str] | None = None
+    ) -> ConfigFlowResult:
         """Show the Hass.io confirmation form to the user."""
+        assert self._hassio_discovery
         return self.async_show_form(
             step_id="hassio_confirm",
             description_placeholders={"addon": self._hassio_discovery["addon"]},
-            data_schema=vol.Schema({}),
             errors=errors or {},
         )
 
-    async def async_step_user(self, user_input=None):
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle a flow initiated by the user."""
-        if self._async_current_entries():
-            return self.async_abort(reason="single_instance_allowed")
-
         if user_input is None:
             return await self._show_setup_form(user_input)
 
-        errors = {}
-
-        session = async_get_clientsession(self.hass, user_input[CONF_VERIFY_SSL])
-
-        adguard = AdGuardHome(
-            user_input[CONF_HOST],
-            port=user_input[CONF_PORT],
-            username=user_input.get(CONF_USERNAME),
-            password=user_input.get(CONF_PASSWORD),
-            tls=user_input[CONF_SSL],
-            verify_ssl=user_input[CONF_VERIFY_SSL],
-            session=session,
+        self._async_abort_entries_match(
+            {CONF_HOST: user_input[CONF_HOST], CONF_PORT: user_input[CONF_PORT]}
         )
 
-        try:
-            version = await adguard.version()
-        except AdGuardHomeConnectionError:
-            errors["base"] = "connection_error"
-            return await self._show_setup_form(errors)
-
-        if LooseVersion(MIN_ADGUARD_HOME_VERSION) > LooseVersion(version):
-            return self.async_abort(
-                reason="adguard_home_outdated",
-                description_placeholders={
-                    "current_version": version,
-                    "minimal_version": MIN_ADGUARD_HOME_VERSION,
-                },
-            )
+        if error := await _async_validate_connection(
+            self.hass,
+            host=user_input[CONF_HOST],
+            port=user_input[CONF_PORT],
+            ssl=user_input[CONF_SSL],
+            verify_ssl=user_input[CONF_VERIFY_SSL],
+            username=user_input.get(CONF_USERNAME),
+            password=user_input.get(CONF_PASSWORD),
+        ):
+            return await self._show_setup_form({"base": error})
 
         return self.async_create_entry(
             title=user_input[CONF_HOST],
@@ -109,74 +135,35 @@ class AdGuardHomeFlowHandler(ConfigFlow):
             },
         )
 
-    async def async_step_hassio(self, user_input=None):
-        """Prepare configuration for a Hass.io AdGuard Home add-on.
+    @override
+    async def async_step_hassio(
+        self, discovery_info: HassioServiceInfo
+    ) -> ConfigFlowResult:
+        """Prepare configuration for a Hass.io AdGuard Home app.
 
         This flow is triggered by the discovery component.
         """
-        entries = self._async_current_entries()
+        await self._async_handle_discovery_without_unique_id()
 
-        if not entries:
-            self._hassio_discovery = user_input
-            return await self.async_step_hassio_confirm()
+        self._hassio_discovery = discovery_info.config
+        return await self.async_step_hassio_confirm()
 
-        cur_entry = entries[0]
-
-        if (
-            cur_entry.data[CONF_HOST] == user_input[CONF_HOST]
-            and cur_entry.data[CONF_PORT] == user_input[CONF_PORT]
-        ):
-            return self.async_abort(reason="single_instance_allowed")
-
-        is_loaded = cur_entry.state == config_entries.ENTRY_STATE_LOADED
-
-        if is_loaded:
-            await self.hass.config_entries.async_unload(cur_entry.entry_id)
-
-        self.hass.config_entries.async_update_entry(
-            cur_entry,
-            data={
-                **cur_entry.data,
-                CONF_HOST: user_input[CONF_HOST],
-                CONF_PORT: user_input[CONF_PORT],
-            },
-        )
-
-        if is_loaded:
-            await self.hass.config_entries.async_setup(cur_entry.entry_id)
-
-        return self.async_abort(reason="existing_instance_updated")
-
-    async def async_step_hassio_confirm(self, user_input=None):
-        """Confirm Hass.io discovery."""
+    async def async_step_hassio_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Confirm Supervisor discovery."""
         if user_input is None:
             return await self._show_hassio_form()
 
-        errors = {}
-
-        session = async_get_clientsession(self.hass, False)
-
-        adguard = AdGuardHome(
-            self._hassio_discovery[CONF_HOST],
+        assert self._hassio_discovery
+        if error := await _async_validate_connection(
+            self.hass,
+            host=self._hassio_discovery[CONF_HOST],
             port=self._hassio_discovery[CONF_PORT],
-            tls=False,
-            session=session,
-        )
-
-        try:
-            version = await adguard.version()
-        except AdGuardHomeConnectionError:
-            errors["base"] = "connection_error"
-            return await self._show_hassio_form(errors)
-
-        if LooseVersion(MIN_ADGUARD_HOME_VERSION) > LooseVersion(version):
-            return self.async_abort(
-                reason="adguard_home_addon_outdated",
-                description_placeholders={
-                    "current_version": version,
-                    "minimal_version": MIN_ADGUARD_HOME_VERSION,
-                },
-            )
+            ssl=False,
+            verify_ssl=True,
+        ):
+            return await self._show_hassio_form({"base": error})
 
         return self.async_create_entry(
             title=self._hassio_discovery["addon"],
@@ -188,4 +175,98 @@ class AdGuardHomeFlowHandler(ConfigFlow):
                 CONF_USERNAME: None,
                 CONF_VERIFY_SSL: True,
             },
+        )
+
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
+        """Handle a request to authenticate with AdGuard Home again."""
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Ask for new credentials for AdGuard Home."""
+        reauth_entry = self._get_reauth_entry()
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            if error := await _async_validate_connection(
+                self.hass,
+                host=reauth_entry.data[CONF_HOST],
+                port=reauth_entry.data[CONF_PORT],
+                ssl=reauth_entry.data[CONF_SSL],
+                verify_ssl=reauth_entry.data[CONF_VERIFY_SSL],
+                username=user_input[CONF_USERNAME],
+                password=user_input[CONF_PASSWORD],
+            ):
+                errors["base"] = error
+            else:
+                return self.async_update_reload_and_abort(
+                    reauth_entry, data_updates=user_input
+                )
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=probatio.Schema(
+                {
+                    probatio.Required(
+                        CONF_USERNAME, default=reauth_entry.data[CONF_USERNAME] or ""
+                    ): str,
+                    probatio.Required(probatio.Secret(CONF_PASSWORD)): str,
+                }
+            ),
+            errors=errors,
+        )
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle reconfiguration of the connection to AdGuard Home."""
+        reconfigure_entry = self._get_reconfigure_entry()
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            self._async_abort_entries_match(
+                {CONF_HOST: user_input[CONF_HOST], CONF_PORT: user_input[CONF_PORT]}
+            )
+
+            if error := await _async_validate_connection(
+                self.hass,
+                host=user_input[CONF_HOST],
+                port=user_input[CONF_PORT],
+                ssl=user_input[CONF_SSL],
+                verify_ssl=user_input[CONF_VERIFY_SSL],
+                username=user_input.get(CONF_USERNAME),
+                password=user_input.get(CONF_PASSWORD),
+            ):
+                errors["base"] = error
+            else:
+                # Disabled entries are not migrated on setup, and the
+                # migration matches entities by the current host and port.
+                await reconfigure_entry.async_migrate(self.hass)
+                return self.async_update_reload_and_abort(
+                    reconfigure_entry,
+                    data_updates={
+                        CONF_HOST: user_input[CONF_HOST],
+                        CONF_PASSWORD: user_input.get(CONF_PASSWORD),
+                        CONF_PORT: user_input[CONF_PORT],
+                        CONF_SSL: user_input[CONF_SSL],
+                        CONF_USERNAME: user_input.get(CONF_USERNAME),
+                        CONF_VERIFY_SSL: user_input[CONF_VERIFY_SSL],
+                    },
+                )
+
+        suggested_values = user_input or reconfigure_entry.data
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=self.add_suggested_values_to_schema(
+                STEP_USER_DATA_SCHEMA,
+                {
+                    key: value
+                    for key, value in suggested_values.items()
+                    if key != CONF_PASSWORD and value is not None
+                },
+            ),
+            errors=errors,
         )

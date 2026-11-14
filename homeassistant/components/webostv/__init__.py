@@ -1,188 +1,76 @@
-"""Support for WebOS TV."""
-import asyncio
-import logging
+"""The LG webOS TV integration."""
 
-from aiopylgtv import PyLGTVCmdException, PyLGTVPairException, WebOsClient
-import voluptuous as vol
-from websockets.exceptions import ConnectionClosed
+from aiowebostv import WebOsClient
 
+from homeassistant.components import notify as hass_notify
 from homeassistant.const import (
-    ATTR_ENTITY_ID,
-    CONF_CUSTOMIZE,
+    ATTR_CONFIG_ENTRY_ID,
+    CONF_CLIENT_SECRET,
     CONF_HOST,
-    CONF_ICON,
     CONF_NAME,
     EVENT_HOMEASSISTANT_STOP,
+    Platform,
 )
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.core import Event, HomeAssistant
+from homeassistant.helpers import config_validation as cv, discovery
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.typing import ConfigType
 
-from .const import ATTR_SOUND_OUTPUT
+from .const import DOMAIN, PLATFORMS
+from .coordinator import WebOsTvConfigEntry, WebOsTvDataUpdateCoordinator
+from .services import async_setup_services
 
-DOMAIN = "webostv"
-
-CONF_SOURCES = "sources"
-CONF_ON_ACTION = "turn_on_action"
-DEFAULT_NAME = "LG webOS Smart TV"
-WEBOSTV_CONFIG_FILE = "webostv.conf"
-
-SERVICE_BUTTON = "button"
-ATTR_BUTTON = "button"
-
-SERVICE_COMMAND = "command"
-ATTR_COMMAND = "command"
-
-SERVICE_SELECT_SOUND_OUTPUT = "select_sound_output"
-
-CUSTOMIZE_SCHEMA = vol.Schema(
-    {vol.Optional(CONF_SOURCES, default=[]): vol.All(cv.ensure_list, [cv.string])}
-)
-
-CONFIG_SCHEMA = vol.Schema(
-    {
-        DOMAIN: vol.All(
-            cv.ensure_list,
-            [
-                vol.Schema(
-                    {
-                        vol.Optional(CONF_CUSTOMIZE, default={}): CUSTOMIZE_SCHEMA,
-                        vol.Required(CONF_HOST): cv.string,
-                        vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
-                        vol.Optional(CONF_ON_ACTION): cv.SCRIPT_SCHEMA,
-                        vol.Optional(CONF_ICON): cv.string,
-                    }
-                )
-            ],
-        )
-    },
-    extra=vol.ALLOW_EXTRA,
-)
-
-CALL_SCHEMA = vol.Schema({vol.Required(ATTR_ENTITY_ID): cv.comp_entity_ids})
-
-BUTTON_SCHEMA = CALL_SCHEMA.extend({vol.Required(ATTR_BUTTON): cv.string})
-
-COMMAND_SCHEMA = CALL_SCHEMA.extend({vol.Required(ATTR_COMMAND): cv.string})
-
-SOUND_OUTPUT_SCHEMA = CALL_SCHEMA.extend({vol.Required(ATTR_SOUND_OUTPUT): cv.string})
-
-SERVICE_TO_METHOD = {
-    SERVICE_BUTTON: {"method": "async_button", "schema": BUTTON_SCHEMA},
-    SERVICE_COMMAND: {"method": "async_command", "schema": COMMAND_SCHEMA},
-    SERVICE_SELECT_SOUND_OUTPUT: {
-        "method": "async_select_sound_output",
-        "schema": SOUND_OUTPUT_SCHEMA,
-    },
-}
-
-_LOGGER = logging.getLogger(__name__)
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 
-async def async_setup(hass, config):
-    """Set up the LG WebOS TV platform."""
-    hass.data[DOMAIN] = {}
-
-    async def async_service_handler(service):
-        method = SERVICE_TO_METHOD.get(service.service)
-        data = service.data.copy()
-        data["method"] = method["method"]
-        async_dispatcher_send(hass, DOMAIN, data)
-
-    for service in SERVICE_TO_METHOD:
-        schema = SERVICE_TO_METHOD[service]["schema"]
-        hass.services.async_register(
-            DOMAIN, service, async_service_handler, schema=schema
-        )
-
-    tasks = [async_setup_tv(hass, config, conf) for conf in config[DOMAIN]]
-    if tasks:
-        await asyncio.gather(*tasks)
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up the LG webOS TV platform."""
+    async_setup_services(hass)
 
     return True
 
 
-async def async_setup_tv(hass, config, conf):
-    """Set up a LG WebOS TV based on host parameter."""
+async def async_setup_entry(hass: HomeAssistant, entry: WebOsTvConfigEntry) -> None:
+    """Set the config entry up."""
+    host = entry.data[CONF_HOST]
+    key = entry.data[CONF_CLIENT_SECRET]
 
-    host = conf[CONF_HOST]
-    config_file = hass.config.path(WEBOSTV_CONFIG_FILE)
+    client = WebOsClient(host, key, client_session=async_get_clientsession(hass))
+    entry.runtime_data = coordinator = WebOsTvDataUpdateCoordinator(hass, entry, client)
+    await coordinator.async_config_entry_first_refresh()
+    await client.register_state_update_callback(coordinator.async_handle_update)
 
-    client = WebOsClient(host, config_file)
-    hass.data[DOMAIN][host] = {"client": client}
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    if client.is_registered():
-        await async_setup_tv_finalize(hass, config, conf, client)
-    else:
-        _LOGGER.warning("LG webOS TV %s needs to be paired", host)
-        await async_request_configuration(hass, config, conf, client)
+    # set up notify platform, no entry support for notify component yet,
+    # have to use discovery to load platform.
+    hass.async_create_task(
+        discovery.async_load_platform(
+            hass,
+            Platform.NOTIFY,
+            DOMAIN,
+            {
+                CONF_NAME: entry.title,
+                ATTR_CONFIG_ENTRY_ID: entry.entry_id,
+            },
+            {},
+        )
+    )
 
-
-async def async_connect(client):
-    """Attempt a connection, but fail gracefully if tv is off for example."""
-    try:
-        await client.connect()
-    except (
-        OSError,
-        ConnectionClosed,
-        ConnectionRefusedError,
-        asyncio.TimeoutError,
-        asyncio.CancelledError,
-        PyLGTVPairException,
-        PyLGTVCmdException,
-    ):
-        pass
-
-
-async def async_setup_tv_finalize(hass, config, conf, client):
-    """Make initial connection attempt and call platform setup."""
-
-    async def async_on_stop(event):
+    async def async_on_stop(_event: Event) -> None:
         """Unregister callbacks and disconnect."""
         client.clear_state_update_callbacks()
         await client.disconnect()
 
-    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, async_on_stop)
-
-    await async_connect(client)
-    hass.async_create_task(
-        hass.helpers.discovery.async_load_platform("media_player", DOMAIN, conf, config)
-    )
-    hass.async_create_task(
-        hass.helpers.discovery.async_load_platform("notify", DOMAIN, conf, config)
+    entry.async_on_unload(
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, async_on_stop)
     )
 
 
-async def async_request_configuration(hass, config, conf, client):
-    """Request configuration steps from the user."""
-    host = conf.get(CONF_HOST)
-    name = conf.get(CONF_NAME)
-    configurator = hass.components.configurator
-
-    async def lgtv_configuration_callback(data):
-        """Handle actions when configuration callback is called."""
-        try:
-            await client.connect()
-        except PyLGTVPairException:
-            _LOGGER.warning("Connected to LG webOS TV %s but not paired", host)
-            return
-        except (
-            OSError,
-            ConnectionClosed,
-            ConnectionRefusedError,
-            asyncio.TimeoutError,
-            asyncio.CancelledError,
-            PyLGTVCmdException,
-        ):
-            _LOGGER.error("Unable to connect to host %s", host)
-            return
-
-        await async_setup_tv_finalize(hass, config, conf, client)
-        configurator.async_request_done(request_id)
-
-    request_id = configurator.async_request_config(
-        name,
-        lgtv_configuration_callback,
-        description="Click start and accept the pairing request on your TV.",
-        description_image="/static/images/config_webos.png",
-        submit_caption="Start pairing request",
-    )
+async def async_unload_entry(hass: HomeAssistant, entry: WebOsTvConfigEntry) -> None:
+    """Unload a config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
+    client = entry.runtime_data.client
+    await hass_notify.async_reload(hass, DOMAIN)
+    client.clear_state_update_callbacks()
+    await client.disconnect()

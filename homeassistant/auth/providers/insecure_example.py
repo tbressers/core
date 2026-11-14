@@ -1,27 +1,28 @@
 """Example auth provider."""
-from collections import OrderedDict
-import hmac
-from typing import Any, Dict, Optional, cast
 
-import voluptuous as vol
+from collections.abc import Mapping
+import hmac
+from typing import override
+
+import probatio
 
 from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
 
-from . import AUTH_PROVIDER_SCHEMA, AUTH_PROVIDERS, AuthProvider, LoginFlow
-from ..models import Credentials, UserMeta
+from ..models import AuthFlowContext, AuthFlowResult, Credentials, UserMeta
+from . import AUTH_PROVIDER_SCHEMA, AUTH_PROVIDERS, AuthProvider, MfaLoginFlow
 
-USER_SCHEMA = vol.Schema(
+USER_SCHEMA = probatio.Schema(
     {
-        vol.Required("username"): str,
-        vol.Required("password"): str,
-        vol.Optional("name"): str,
+        probatio.Required("username"): str,
+        probatio.Required("password"): str,
+        probatio.Optional("name"): str,
     }
 )
 
 
 CONFIG_SCHEMA = AUTH_PROVIDER_SCHEMA.extend(
-    {vol.Required("users"): [USER_SCHEMA]}, extra=vol.PREVENT_EXTRA
+    {probatio.Required("users"): [USER_SCHEMA]}, extra=probatio.PREVENT_EXTRA
 )
 
 
@@ -33,7 +34,10 @@ class InvalidAuthError(HomeAssistantError):
 class ExampleAuthProvider(AuthProvider):
     """Example auth provider based on hardcoded usernames and passwords."""
 
-    async def async_login_flow(self, context: Optional[Dict]) -> LoginFlow:
+    @override
+    async def async_login_flow(
+        self, context: AuthFlowContext | None
+    ) -> ExampleLoginFlow:
         """Return a flow to login."""
         return ExampleLoginFlow(self)
 
@@ -59,8 +63,9 @@ class ExampleAuthProvider(AuthProvider):
         ):
             raise InvalidAuthError
 
+    @override
     async def async_get_or_create_credentials(
-        self, flow_result: Dict[str, str]
+        self, flow_result: Mapping[str, str]
     ) -> Credentials:
         """Get credentials based on the flow result."""
         username = flow_result["username"]
@@ -72,6 +77,7 @@ class ExampleAuthProvider(AuthProvider):
         # Create new credentials.
         return self.async_create_credentials({"username": username})
 
+    @override
     async def async_user_meta_for_credentials(
         self, credentials: Credentials
     ) -> UserMeta:
@@ -90,31 +96,35 @@ class ExampleAuthProvider(AuthProvider):
         return UserMeta(name=name, is_active=True)
 
 
-class ExampleLoginFlow(LoginFlow):
+class ExampleLoginFlow(MfaLoginFlow[ExampleAuthProvider]):
     """Handler for the login flow."""
 
+    @override
     async def async_step_init(
-        self, user_input: Optional[Dict[str, str]] = None
-    ) -> Dict[str, Any]:
+        self, user_input: dict[str, str] | None = None
+    ) -> AuthFlowResult:
         """Handle the step of the form."""
-        errors = {}
+        errors = None
 
         if user_input is not None:
             try:
-                cast(ExampleAuthProvider, self._auth_provider).async_validate_login(
+                self._auth_provider.async_validate_login(
                     user_input["username"], user_input["password"]
                 )
             except InvalidAuthError:
-                errors["base"] = "invalid_auth"
+                errors = {"base": "invalid_auth"}
 
             if not errors:
                 user_input.pop("password")
                 return await self.async_finish(user_input)
 
-        schema: Dict[str, type] = OrderedDict()
-        schema["username"] = str
-        schema["password"] = str
-
         return self.async_show_form(
-            step_id="init", data_schema=vol.Schema(schema), errors=errors
+            step_id="init",
+            data_schema=probatio.Schema(
+                {
+                    probatio.Required("username"): str,
+                    probatio.Required("password"): str,
+                }
+            ),
+            errors=errors,
         )

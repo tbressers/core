@@ -1,42 +1,63 @@
 """Support for NuHeat thermostats."""
-import logging
+
+from http import HTTPStatus
 
 import nuheat
-import voluptuous as vol
+import requests
 
-from homeassistant.const import CONF_DEVICES, CONF_PASSWORD, CONF_USERNAME
-from homeassistant.helpers import config_validation as cv, discovery
+from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady
 
-_LOGGER = logging.getLogger(__name__)
-
-DOMAIN = "nuheat"
-
-CONFIG_SCHEMA = vol.Schema(
-    {
-        DOMAIN: vol.Schema(
-            {
-                vol.Required(CONF_USERNAME): cv.string,
-                vol.Required(CONF_PASSWORD): cv.string,
-                vol.Required(CONF_DEVICES, default=[]): vol.All(
-                    cv.ensure_list, [cv.string]
-                ),
-            }
-        )
-    },
-    extra=vol.ALLOW_EXTRA,
-)
+from .const import CONF_SERIAL_NUMBER, DOMAIN, PLATFORMS
+from .coordinator import NuHeatConfigEntry, NuHeatCoordinator
 
 
-def setup(hass, config):
-    """Set up the NuHeat thermostat component."""
-    conf = config[DOMAIN]
-    username = conf.get(CONF_USERNAME)
-    password = conf.get(CONF_PASSWORD)
-    devices = conf.get(CONF_DEVICES)
+def _get_thermostat(api: nuheat.NuHeat, serial_number: str) -> nuheat.NuHeatThermostat:
+    """Authenticate and create the thermostat object."""
+    api.authenticate()
+    return api.get_thermostat(serial_number)
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: NuHeatConfigEntry) -> None:
+    """Set up NuHeat from a config entry."""
+
+    conf = entry.data
+
+    username: str = conf[CONF_USERNAME]
+    password: str = conf[CONF_PASSWORD]
+    serial_number: str = conf[CONF_SERIAL_NUMBER]
 
     api = nuheat.NuHeat(username, password)
-    api.authenticate()
-    hass.data[DOMAIN] = (api, devices)
 
-    discovery.load_platform(hass, "climate", DOMAIN, {}, config)
-    return True
+    try:
+        thermostat = await hass.async_add_executor_job(
+            _get_thermostat, api, serial_number
+        )
+    except requests.exceptions.Timeout as ex:
+        raise ConfigEntryNotReady from ex
+    except requests.exceptions.HTTPError as ex:
+        if (
+            HTTPStatus.BAD_REQUEST
+            < ex.response.status_code
+            < HTTPStatus.INTERNAL_SERVER_ERROR
+        ):
+            raise ConfigEntryError(
+                translation_domain=DOMAIN,
+                translation_key="login_failed",
+            ) from ex
+        raise ConfigEntryNotReady from ex
+    except Exception as ex:
+        raise ConfigEntryError(
+            translation_domain=DOMAIN,
+            translation_key="login_failed",
+        ) from ex
+
+    entry.runtime_data = NuHeatCoordinator(hass, entry, thermostat)
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: NuHeatConfigEntry) -> None:
+    """Unload a config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)

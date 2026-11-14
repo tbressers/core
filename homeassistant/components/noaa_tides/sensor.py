@@ -1,44 +1,60 @@
 """Support for the NOAA Tides and Currents API."""
-from datetime import datetime, timedelta
+
 import logging
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, override
 
-from py_noaa import coops  # pylint: disable=import-error
-import voluptuous as vol
+import noaa_coops as coops
+import probatio
+import requests
 
-from homeassistant.components.sensor import PLATFORM_SCHEMA
-from homeassistant.const import (
-    ATTR_ATTRIBUTION,
-    CONF_NAME,
-    CONF_TIME_ZONE,
-    CONF_UNIT_SYSTEM,
+from homeassistant.components.sensor import (
+    PLATFORM_SCHEMA as SENSOR_PLATFORM_SCHEMA,
+    SensorEntity,
 )
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.entity import Entity
+from homeassistant.const import CONF_NAME, CONF_TIME_ZONE, CONF_UNIT_SYSTEM
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import PlatformNotReady
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.util import dt as dt_util
+from homeassistant.util.unit_system import METRIC_SYSTEM
+
+from .const import (
+    ATTRIBUTION,
+    CONF_STATION_ID,
+    DEFAULT_NAME,
+    DEFAULT_PREDICTION_LENGTH,
+    DEFAULT_TIMEZONE,
+)
+from .helpers import get_station_unique_id
+
+if TYPE_CHECKING:
+    from pandas import Timestamp
 
 _LOGGER = logging.getLogger(__name__)
-
-CONF_STATION_ID = "station_id"
-
-DEFAULT_ATTRIBUTION = "Data provided by NOAA"
-DEFAULT_NAME = "NOAA Tides"
-DEFAULT_TIMEZONE = "lst_ldt"
-
-SCAN_INTERVAL = timedelta(minutes=60)
 
 TIMEZONES = ["gmt", "lst", "lst_ldt"]
 UNIT_SYSTEMS = ["english", "metric"]
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = SENSOR_PLATFORM_SCHEMA.extend(
     {
-        vol.Required(CONF_STATION_ID): cv.string,
-        vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
-        vol.Optional(CONF_TIME_ZONE, default=DEFAULT_TIMEZONE): vol.In(TIMEZONES),
-        vol.Optional(CONF_UNIT_SYSTEM): vol.In(UNIT_SYSTEMS),
+        probatio.Required(CONF_STATION_ID): cv.string,
+        probatio.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
+        probatio.Optional(CONF_TIME_ZONE, default=DEFAULT_TIMEZONE): probatio.In(
+            TIMEZONES
+        ),
+        probatio.Optional(CONF_UNIT_SYSTEM): probatio.In(UNIT_SYSTEMS),
     }
 )
 
 
-def setup_platform(hass, config, add_entities, discovery_info=None):
+def setup_platform(
+    hass: HomeAssistant,
+    config: ConfigType,
+    add_entities: AddEntitiesCallback,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> None:
     """Set up the NOAA Tides and Currents sensor."""
     station_id = config[CONF_STATION_ID]
     name = config.get(CONF_NAME)
@@ -46,60 +62,93 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
 
     if CONF_UNIT_SYSTEM in config:
         unit_system = config[CONF_UNIT_SYSTEM]
-    elif hass.config.units.is_metric:
-        unit_system = UNIT_SYSTEMS[1]
+    elif hass.config.units is METRIC_SYSTEM:
+        unit_system = "metric"
     else:
-        unit_system = UNIT_SYSTEMS[0]
+        unit_system = "english"
 
-    noaa_sensor = NOAATidesAndCurrentsSensor(name, station_id, timezone, unit_system)
-
-    noaa_sensor.update()
-    if noaa_sensor.data is None:
-        _LOGGER.error("Unable to setup NOAA Tides Sensor")
+    try:
+        station = coops.Station(station_id, unit_system)
+    except KeyError:
+        _LOGGER.error("NOAA Tides Sensor station_id %s does not exist", station_id)
         return
+    except requests.exceptions.ConnectionError as exception:
+        _LOGGER.error(
+            "Connection error during setup in NOAA Tides Sensor for station_id: %s",
+            station_id,
+        )
+        raise PlatformNotReady from exception
+
+    noaa_sensor = NOAATidesAndCurrentsSensor(
+        name, station_id, timezone, unit_system, station
+    )
+
     add_entities([noaa_sensor], True)
 
 
-class NOAATidesAndCurrentsSensor(Entity):
+class NOAATidesData(TypedDict):
+    """Representation of a single tide."""
+
+    time_stamp: list[Timestamp]
+    hi_lo: list[Literal["L", "H"]]
+    predicted_wl: list[float]
+
+
+class NOAATidesAndCurrentsSensor(SensorEntity):
     """Representation of a NOAA Tides and Currents sensor."""
 
-    def __init__(self, name, station_id, timezone, unit_system):
+    _attr_attribution = ATTRIBUTION
+
+    def __init__(self, name, station_id, timezone, unit_system, station) -> None:
         """Initialize the sensor."""
         self._name = name
         self._station_id = station_id
         self._timezone = timezone
         self._unit_system = unit_system
-        self.data = None
+        self._station = station
+        self.data: NOAATidesData | None = None
+        self._attr_unique_id = f"{get_station_unique_id(station_id)}_summary"
 
     @property
-    def name(self):
+    @override
+    def name(self) -> str:
         """Return the name of the sensor."""
         return self._name
 
     @property
-    def device_state_attributes(self):
+    @override
+    def extra_state_attributes(self) -> dict[str, Any]:
         """Return the state attributes of this device."""
-        attr = {ATTR_ATTRIBUTION: DEFAULT_ATTRIBUTION}
+        attr: dict[str, Any] = {}
         if self.data is None:
             return attr
         if self.data["hi_lo"][1] == "H":
-            attr["high_tide_time"] = self.data.index[1].strftime("%Y-%m-%dT%H:%M")
+            attr["high_tide_time"] = self.data["time_stamp"][1].strftime(
+                "%Y-%m-%dT%H:%M"
+            )
             attr["high_tide_height"] = self.data["predicted_wl"][1]
-            attr["low_tide_time"] = self.data.index[2].strftime("%Y-%m-%dT%H:%M")
+            attr["low_tide_time"] = self.data["time_stamp"][2].strftime(
+                "%Y-%m-%dT%H:%M"
+            )
             attr["low_tide_height"] = self.data["predicted_wl"][2]
         elif self.data["hi_lo"][1] == "L":
-            attr["low_tide_time"] = self.data.index[1].strftime("%Y-%m-%dT%H:%M")
+            attr["low_tide_time"] = self.data["time_stamp"][1].strftime(
+                "%Y-%m-%dT%H:%M"
+            )
             attr["low_tide_height"] = self.data["predicted_wl"][1]
-            attr["high_tide_time"] = self.data.index[2].strftime("%Y-%m-%dT%H:%M")
+            attr["high_tide_time"] = self.data["time_stamp"][2].strftime(
+                "%Y-%m-%dT%H:%M"
+            )
             attr["high_tide_height"] = self.data["predicted_wl"][2]
         return attr
 
     @property
-    def state(self):
-        """Return the state of the device."""
+    @override
+    def native_value(self) -> str | None:
+        """Return the state."""
         if self.data is None:
             return None
-        api_time = self.data.index[0]
+        api_time = self.data["time_stamp"][0]
         if self.data["hi_lo"][0] == "H":
             tidetime = api_time.strftime("%-I:%M %p")
             return f"High tide at {tidetime}"
@@ -108,29 +157,42 @@ class NOAATidesAndCurrentsSensor(Entity):
             return f"Low tide at {tidetime}"
         return None
 
-    def update(self):
+    def update(self) -> None:
         """Get the latest data from NOAA Tides and Currents API."""
-
-        begin = datetime.now()
-        delta = timedelta(days=2)
-        end = begin + delta
+        begin = dt_util.now()
+        end = begin + DEFAULT_PREDICTION_LENGTH
         try:
-            df_predictions = coops.get_data(
+            df_predictions = self._station.get_data(
                 begin_date=begin.strftime("%Y%m%d %H:%M"),
                 end_date=end.strftime("%Y%m%d %H:%M"),
-                stationid=self._station_id,
                 product="predictions",
                 datum="MLLW",
                 interval="hilo",
                 units=self._unit_system,
                 time_zone=self._timezone,
             )
-            self.data = df_predictions.head()
-            _LOGGER.debug("Data = %s", self.data)
+            api_data = df_predictions.head()
+            self.data = NOAATidesData(
+                time_stamp=list(api_data.index),
+                hi_lo=list(api_data["type"].values),
+                predicted_wl=list(api_data["v"].values),
+            )
+            _LOGGER.debug("Data = %s", api_data)
             _LOGGER.debug(
                 "Recent Tide data queried with start time set to %s",
                 begin.strftime("%m-%d-%Y %H:%M"),
             )
+        except (
+            coops.station.COOPSAPIError,
+            requests.exceptions.RequestException,
+        ) as err:
+            if self._attr_available:
+                _LOGGER.info("NOAA Tides and Currents API is unavailable: %s", err)
+                self._attr_available = False
+            return
         except ValueError as err:
             _LOGGER.error("Check NOAA Tides and Currents: %s", err.args)
             self.data = None
+        if not self._attr_available:
+            _LOGGER.info("NOAA Tides and Currents API is available again")
+            self._attr_available = True

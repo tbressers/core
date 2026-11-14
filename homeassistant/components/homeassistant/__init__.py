@@ -1,196 +1,179 @@
 """Integration providing core pieces of infrastructure."""
+
 import asyncio
-import itertools as it
+from collections.abc import Callable, Coroutine
 import logging
-from typing import Awaitable
+import struct
+from typing import Any
 
-import voluptuous as vol
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, RESTART_EXIT_CODE
+from homeassistant.core import Event, HomeAssistant, callback
+from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.issue_registry import IssueSeverity
+from homeassistant.helpers.signal import KEY_HA_STOP
+from homeassistant.helpers.start import async_at_started
+from homeassistant.helpers.storage import Store
+from homeassistant.helpers.system_info import async_get_system_info
+from homeassistant.helpers.typing import ConfigType
 
-from homeassistant.auth.permissions.const import CAT_ENTITIES, POLICY_CONTROL
-import homeassistant.config as conf_util
-from homeassistant.const import (
-    ATTR_ENTITY_ID,
-    ATTR_LATITUDE,
-    ATTR_LONGITUDE,
-    RESTART_EXIT_CODE,
+# The scene integration will do a late import of scene
+# so we want to make sure its loaded with the component
+# so its already in memory when its imported so the import
+# does not do blocking I/O in the event loop.
+from . import scene as scene_pre_import  # noqa: F401
+from .const import (
+    DATA_EXPOSED_ENTITIES,
+    DATA_STOP_HANDLER,
+    DOMAIN,
     SERVICE_HOMEASSISTANT_RESTART,
     SERVICE_HOMEASSISTANT_STOP,
-    SERVICE_TOGGLE,
-    SERVICE_TURN_OFF,
-    SERVICE_TURN_ON,
+    HomeAssistantService,
 )
-import homeassistant.core as ha
-from homeassistant.exceptions import HomeAssistantError, Unauthorized, UnknownUser
-from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.service import async_extract_entity_ids
+from .exposed_entities import ExposedEntities, async_should_expose
+from .services import async_setup_services
+
+# To be deprecated at a later stage, replaced by HomeAssistantService
+SERVICE_RELOAD_CORE_CONFIG = HomeAssistantService.RELOAD_CORE_CONFIG.value
+SERVICE_RELOAD_CONFIG_ENTRY = HomeAssistantService.RELOAD_CONFIG_ENTRY.value
+SERVICE_RELOAD_CUSTOM_TEMPLATES = HomeAssistantService.RELOAD_CUSTOM_TEMPLATES.value
+SERVICE_CHECK_CONFIG = HomeAssistantService.CHECK_CONFIG.value
+SERVICE_UPDATE_ENTITY = HomeAssistantService.UPDATE_ENTITY.value
+SERVICE_SET_LOCATION = HomeAssistantService.SET_LOCATION.value
+SERVICE_RELOAD_ALL = HomeAssistantService.RELOAD_ALL.value
+
+DEPRECATION_URL = (
+    "https://www.home-assistant.io/blog/2025/05/22/"
+    "deprecating-core-and-supervised-installation-methods-and-32-bit-systems/"
+)
 
 _LOGGER = logging.getLogger(__name__)
-DOMAIN = ha.DOMAIN
-SERVICE_RELOAD_CORE_CONFIG = "reload_core_config"
-SERVICE_CHECK_CONFIG = "check_config"
-SERVICE_UPDATE_ENTITY = "update_entity"
-SERVICE_SET_LOCATION = "set_location"
-SCHEMA_UPDATE_ENTITY = vol.Schema({ATTR_ENTITY_ID: cv.entity_ids})
+
+# Storage of the removed almond integration, which created an admin system user
+LEGACY_ALMOND_STORAGE_KEY = "almond"
+LEGACY_ALMOND_STORAGE_VERSION = 1
+
+__all__ = [
+    "DOMAIN",
+    "SERVICE_HOMEASSISTANT_RESTART",
+    "SERVICE_HOMEASSISTANT_STOP",
+    "SERVICE_RELOAD_ALL",
+    "SERVICE_RELOAD_CONFIG_ENTRY",
+    "SERVICE_RELOAD_CORE_CONFIG",
+    "SERVICE_RELOAD_CUSTOM_TEMPLATES",
+    "HomeAssistantService",
+    "async_set_stop_handler",
+    "async_should_expose",
+]
 
 
-async def async_setup(hass: ha.HomeAssistant, config: dict) -> Awaitable[bool]:
+def _is_32_bit() -> bool:
+    size = struct.calcsize("P")
+    return size * 8 == 32
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up general services related to Home Assistant."""
 
-    async def async_handle_turn_service(service):
-        """Handle calls to homeassistant.turn_on/off."""
-        entity_ids = await async_extract_entity_ids(hass, service)
+    async_setup_services(hass)
 
-        # Generic turn on/off method requires entity id
-        if not entity_ids:
-            _LOGGER.error(
-                "homeassistant/%s cannot be called without entity_id", service.service
-            )
-            return
+    exposed_entities = ExposedEntities(hass)
+    await exposed_entities.async_initialize()
+    hass.data[DATA_EXPOSED_ENTITIES] = exposed_entities
+    async_set_stop_handler(hass)
 
-        # Group entity_ids by domain. groupby requires sorted data.
-        by_domain = it.groupby(
-            sorted(entity_ids), lambda item: ha.split_entity_id(item)[0]
-        )
+    async def _async_check_deprecation(event: Event) -> None:
+        """Check and create deprecation issues after startup."""
+        info = await async_get_system_info(hass)
 
-        tasks = []
-
-        for domain, ent_ids in by_domain:
-            # This leads to endless loop.
-            if domain == DOMAIN:
-                _LOGGER.warning(
-                    "Called service homeassistant.%s with invalid entity IDs %s",
-                    service.service,
-                    ", ".join(ent_ids),
+        installation_type = info["installation_type"][15:]
+        if installation_type in {"Core", "Container"}:
+            deprecated_method = installation_type == "Core"
+            bit32 = _is_32_bit()
+            arch = info["arch"]
+            if bit32 and installation_type == "Container":
+                arch = info.get("container_arch", arch)
+                ir.async_create_issue(
+                    hass,
+                    DOMAIN,
+                    "deprecated_container",
+                    learn_more_url=DEPRECATION_URL,
+                    is_fixable=False,
+                    severity=IssueSeverity.WARNING,
+                    translation_key="deprecated_container",
+                    translation_placeholders={"arch": arch},
                 )
-                continue
-
-            # We want to block for all calls and only return when all calls
-            # have been processed. If a service does not exist it causes a 10
-            # second delay while we're blocking waiting for a response.
-            # But services can be registered on other HA instances that are
-            # listening to the bus too. So as an in between solution, we'll
-            # block only if the service is defined in the current HA instance.
-            blocking = hass.services.has_service(domain, service.service)
-
-            # Create a new dict for this call
-            data = dict(service.data)
-
-            # ent_ids is a generator, convert it to a list.
-            data[ATTR_ENTITY_ID] = list(ent_ids)
-
-            tasks.append(
-                hass.services.async_call(domain, service.service, data, blocking)
-            )
-
-        if tasks:
-            await asyncio.gather(*tasks)
-
-    service_schema = vol.Schema({ATTR_ENTITY_ID: cv.entity_ids}, extra=vol.ALLOW_EXTRA)
-
-    hass.services.async_register(
-        ha.DOMAIN, SERVICE_TURN_OFF, async_handle_turn_service, schema=service_schema
-    )
-    hass.services.async_register(
-        ha.DOMAIN, SERVICE_TURN_ON, async_handle_turn_service, schema=service_schema
-    )
-    hass.services.async_register(
-        ha.DOMAIN, SERVICE_TOGGLE, async_handle_turn_service, schema=service_schema
-    )
-
-    async def async_handle_core_service(call):
-        """Service handler for handling core services."""
-        if call.service == SERVICE_HOMEASSISTANT_STOP:
-            hass.async_create_task(hass.async_stop())
-            return
-
-        try:
-            errors = await conf_util.async_check_ha_config_file(hass)
-        except HomeAssistantError:
-            return
-
-        if errors:
-            _LOGGER.error(errors)
-            hass.components.persistent_notification.async_create(
-                "Config error. See [the logs](/developer-tools/logs) for details.",
-                "Config validating",
-                f"{ha.DOMAIN}.check_config",
-            )
-            return
-
-        if call.service == SERVICE_HOMEASSISTANT_RESTART:
-            hass.async_create_task(hass.async_stop(RESTART_EXIT_CODE))
-
-    async def async_handle_update_service(call):
-        """Service handler for updating an entity."""
-        if call.context.user_id:
-            user = await hass.auth.async_get_user(call.context.user_id)
-
-            if user is None:
-                raise UnknownUser(
-                    context=call.context,
-                    permission=POLICY_CONTROL,
-                    user_id=call.context.user_id,
+            deprecated_architecture = bit32 and installation_type != "Container"
+            if deprecated_method or deprecated_architecture:
+                issue_id = "deprecated"
+                if deprecated_method:
+                    issue_id += "_method"
+                if deprecated_architecture:
+                    issue_id += "_architecture"
+                ir.async_create_issue(
+                    hass,
+                    DOMAIN,
+                    issue_id,
+                    learn_more_url=DEPRECATION_URL,
+                    is_fixable=False,
+                    severity=IssueSeverity.WARNING,
+                    translation_key=issue_id,
+                    translation_placeholders={
+                        "installation_type": installation_type,
+                        "arch": arch,
+                    },
                 )
+        if not info["docker"] and not info["virtualenv"]:
+            ir.async_create_issue(
+                hass,
+                DOMAIN,
+                "unsupported_local_deps",
+                breaks_in_ha_version="2026.11.0",
+                learn_more_url=DEPRECATION_URL,
+                is_fixable=False,
+                severity=IssueSeverity.WARNING,
+                translation_key="unsupported_local_deps",
+            )
 
-            for entity in call.data[ATTR_ENTITY_ID]:
-                if not user.permissions.check_entity(entity, POLICY_CONTROL):
-                    raise Unauthorized(
-                        context=call.context,
-                        permission=POLICY_CONTROL,
-                        user_id=call.context.user_id,
-                        perm_category=CAT_ENTITIES,
-                    )
+    # Delay deprecation check to make sure installation method is determined correctly
+    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _async_check_deprecation)
 
-        tasks = [
-            hass.helpers.entity_component.async_update_entity(entity)
-            for entity in call.data[ATTR_ENTITY_ID]
-        ]
-
-        if tasks:
-            await asyncio.wait(tasks)
-
-    hass.helpers.service.async_register_admin_service(
-        ha.DOMAIN, SERVICE_HOMEASSISTANT_STOP, async_handle_core_service
-    )
-    hass.helpers.service.async_register_admin_service(
-        ha.DOMAIN, SERVICE_HOMEASSISTANT_RESTART, async_handle_core_service
-    )
-    hass.helpers.service.async_register_admin_service(
-        ha.DOMAIN, SERVICE_CHECK_CONFIG, async_handle_core_service
-    )
-    hass.services.async_register(
-        ha.DOMAIN,
-        SERVICE_UPDATE_ENTITY,
-        async_handle_update_service,
-        schema=SCHEMA_UPDATE_ENTITY,
-    )
-
-    async def async_handle_reload_config(call):
-        """Service handler for reloading core config."""
-        try:
-            conf = await conf_util.async_hass_config_yaml(hass)
-        except HomeAssistantError as err:
-            _LOGGER.error(err)
-            return
-
-        # auth only processed during startup
-        await conf_util.async_process_ha_core_config(hass, conf.get(ha.DOMAIN) or {})
-
-    hass.helpers.service.async_register_admin_service(
-        ha.DOMAIN, SERVICE_RELOAD_CORE_CONFIG, async_handle_reload_config
-    )
-
-    async def async_set_location(call):
-        """Service handler to set location."""
-        await hass.config.async_update(
-            latitude=call.data[ATTR_LATITUDE], longitude=call.data[ATTR_LONGITUDE]
-        )
-
-    hass.helpers.service.async_register_admin_service(
-        ha.DOMAIN,
-        SERVICE_SET_LOCATION,
-        async_set_location,
-        vol.Schema({ATTR_LATITUDE: cv.latitude, ATTR_LONGITUDE: cv.longitude}),
-    )
+    async_at_started(hass, _async_remove_legacy_almond_user_and_data)
 
     return True
+
+
+async def _async_remove_legacy_almond_user_and_data(hass: HomeAssistant) -> None:
+    """Remove the system user left behind by the removed almond integration."""
+    store = Store[dict[str, Any]](
+        hass, LEGACY_ALMOND_STORAGE_VERSION, LEGACY_ALMOND_STORAGE_KEY
+    )
+    if (data := await store.async_load()) is None:
+        return
+
+    if (user_id := data.get("almond_user")) and (
+        user := await hass.auth.async_get_user(user_id)
+    ):
+        _LOGGER.debug("Removing system user %s of legacy almond integration", user.id)
+        await hass.auth.async_remove_user(user)
+
+    await store.async_remove()
+
+
+async def _async_stop(hass: HomeAssistant, restart: bool) -> None:
+    """Stop home assistant."""
+    exit_code = RESTART_EXIT_CODE if restart else 0
+    # Track trask in hass.data. No need to cleanup, we're stopping.
+    hass.data[KEY_HA_STOP] = asyncio.create_task(hass.async_stop(exit_code))
+
+
+@callback
+def async_set_stop_handler(
+    hass: HomeAssistant,
+    stop_handler: Callable[[HomeAssistant, bool], Coroutine[Any, Any, None]]
+    | None = None,
+) -> None:
+    """Set function which is called by the stop and restart services.
+
+    If stop handler is omitted it will restore the default stop handler.
+    """
+    hass.data[DATA_STOP_HANDLER] = _async_stop if stop_handler is None else stop_handler

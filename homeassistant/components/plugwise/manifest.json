@@ -1,8 +1,15 @@
 {
   "domain": "plugwise",
-  "name": "Plugwise Anna",
+  "name": "Plugwise",
+  "categories": ["climate.thermostats_heating", "energy.meters_monitoring"],
+  "codeowners": ["@CoMPaTech", "@bouwew"],
+  "config_flow": true,
+  "connectivity": ["network"],
   "documentation": "https://www.home-assistant.io/integrations/plugwise",
-  "dependencies": [],
-  "codeowners": ["@laetificat", "@CoMPaTech", "@bouwew"],
-  "requirements": ["haanna==0.14.3"]
+  "integration_type": "hub",
+  "iot_class": "local_polling",
+  "loggers": ["plugwise"],
+  "quality_scale": "platinum",
+  "requirements": ["plugwise==1.17.0"],
+  "zeroconf": ["_plugwise._tcp.local."]
 }

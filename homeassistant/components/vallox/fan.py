@@ -1,175 +1,232 @@
 """Support for the Vallox ventilation unit fan."""
 
-import logging
+from collections.abc import Mapping
+from typing import Any, NamedTuple, override
 
-from homeassistant.components.fan import FanEntity
-from homeassistant.core import callback
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from vallox_websocket_api import ValloxApiException, ValloxInvalidInputException
 
-from . import (
+from homeassistant.components.fan import FanEntity, FanEntityFeature
+from homeassistant.const import CONF_NAME
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.typing import StateType
+
+from .const import (
     DOMAIN,
     METRIC_KEY_MODE,
     METRIC_KEY_PROFILE_FAN_SPEED_AWAY,
     METRIC_KEY_PROFILE_FAN_SPEED_BOOST,
     METRIC_KEY_PROFILE_FAN_SPEED_HOME,
-    SIGNAL_VALLOX_STATE_UPDATE,
+    MODE_OFF,
+    MODE_ON,
+    PRESET_MODE_TO_VALLOX_PROFILE,
+    VALLOX_PROFILE_TO_PRESET_MODE,
+)
+from .coordinator import ValloxConfigEntry, ValloxDataUpdateCoordinator
+from .entity import ValloxEntity
+
+
+class ExtraStateAttributeDetails(NamedTuple):
+    """Extra state attribute details."""
+
+    description: str
+    metric_key: str
+
+
+EXTRA_STATE_ATTRIBUTES = (
+    ExtraStateAttributeDetails(
+        description="fan_speed_home", metric_key=METRIC_KEY_PROFILE_FAN_SPEED_HOME
+    ),
+    ExtraStateAttributeDetails(
+        description="fan_speed_away", metric_key=METRIC_KEY_PROFILE_FAN_SPEED_AWAY
+    ),
+    ExtraStateAttributeDetails(
+        description="fan_speed_boost", metric_key=METRIC_KEY_PROFILE_FAN_SPEED_BOOST
+    ),
 )
 
-_LOGGER = logging.getLogger(__name__)
 
-# Device attributes
-ATTR_PROFILE_FAN_SPEED_HOME = {
-    "description": "fan_speed_home",
-    "metric_key": METRIC_KEY_PROFILE_FAN_SPEED_HOME,
-}
-ATTR_PROFILE_FAN_SPEED_AWAY = {
-    "description": "fan_speed_away",
-    "metric_key": METRIC_KEY_PROFILE_FAN_SPEED_AWAY,
-}
-ATTR_PROFILE_FAN_SPEED_BOOST = {
-    "description": "fan_speed_boost",
-    "metric_key": METRIC_KEY_PROFILE_FAN_SPEED_BOOST,
-}
+def _convert_to_int(value: StateType) -> int | None:
+    if isinstance(value, (int, float)):
+        return int(value)
+
+    return None
 
 
-async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: ValloxConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
     """Set up the fan device."""
-    if discovery_info is None:
-        return
+    coordinator = entry.runtime_data
 
-    client = hass.data[DOMAIN]["client"]
+    device = ValloxFanEntity(entry.data[CONF_NAME], coordinator)
 
-    client.set_settable_address(METRIC_KEY_MODE, int)
-
-    device = ValloxFan(
-        hass.data[DOMAIN]["name"], client, hass.data[DOMAIN]["state_proxy"]
-    )
-
-    async_add_entities([device], update_before_add=False)
+    async_add_entities([device])
 
 
-class ValloxFan(FanEntity):
+class ValloxFanEntity(ValloxEntity, FanEntity):
     """Representation of the fan."""
 
-    def __init__(self, name, client, state_proxy):
+    _attr_name = None
+    _attr_translation_key = "ventilation"
+    _attr_supported_features = (
+        FanEntityFeature.PRESET_MODE
+        | FanEntityFeature.SET_SPEED
+        | FanEntityFeature.TURN_OFF
+        | FanEntityFeature.TURN_ON
+    )
+
+    def __init__(
+        self,
+        name: str,
+        coordinator: ValloxDataUpdateCoordinator,
+    ) -> None:
         """Initialize the fan."""
-        self._name = name
-        self._client = client
-        self._state_proxy = state_proxy
-        self._available = False
-        self._state = None
-        self._fan_speed_home = None
-        self._fan_speed_away = None
-        self._fan_speed_boost = None
+        super().__init__(name, coordinator)
+
+        self._attr_unique_id = str(self._device_uuid)
+        self._attr_preset_modes = list(PRESET_MODE_TO_VALLOX_PROFILE)
 
     @property
-    def should_poll(self):
-        """Do not poll the device."""
-        return False
-
-    @property
-    def name(self):
-        """Return the name of the device."""
-        return self._name
-
-    @property
-    def available(self):
-        """Return if state is known."""
-        return self._available
-
-    @property
-    def is_on(self):
+    @override
+    def is_on(self) -> bool | None:
         """Return if device is on."""
-        return self._state
+        if (mode := self.coordinator.data.get(METRIC_KEY_MODE)) is None:
+            return None
+        return mode == MODE_ON
 
     @property
-    def device_state_attributes(self):
+    @override
+    def preset_mode(self) -> str | None:
+        """Return the current preset mode."""
+        vallox_profile = self.coordinator.data.profile
+        return VALLOX_PROFILE_TO_PRESET_MODE.get(vallox_profile)
+
+    @property
+    @override
+    def percentage(self) -> int | None:
+        """Return the current speed as a percentage."""
+
+        vallox_profile = self.coordinator.data.profile
+        try:
+            return _convert_to_int(self.coordinator.data.get_fan_speed(vallox_profile))
+        except ValloxInvalidInputException:
+            return None
+
+    @property
+    @override
+    def extra_state_attributes(self) -> Mapping[str, int | None]:
         """Return device specific state attributes."""
+        data = self.coordinator.data
+
         return {
-            ATTR_PROFILE_FAN_SPEED_HOME["description"]: self._fan_speed_home,
-            ATTR_PROFILE_FAN_SPEED_AWAY["description"]: self._fan_speed_away,
-            ATTR_PROFILE_FAN_SPEED_BOOST["description"]: self._fan_speed_boost,
+            attr.description: _convert_to_int(data.get(attr.metric_key))
+            for attr in EXTRA_STATE_ATTRIBUTES
         }
 
-    async def async_added_to_hass(self):
-        """Call to update."""
-        async_dispatcher_connect(
-            self.hass, SIGNAL_VALLOX_STATE_UPDATE, self._update_callback
-        )
+    @override
+    async def async_set_preset_mode(self, preset_mode: str) -> None:
+        """Set new preset mode."""
+        await self._async_set_preset_mode_internal(preset_mode)
 
-    @callback
-    def _update_callback(self):
-        """Call update method."""
-        self.async_schedule_update_ha_state(True)
+        # This state change affects other entities like
+        # sensors. Force an immediate update that can be
+        # observed by all parties involved.
+        await self.coordinator.async_request_refresh()
 
-    async def async_update(self):
-        """Fetch state from the device."""
-        try:
-            # Fetch if the whole device is in regular operation state.
-            mode = self._state_proxy.fetch_metric(METRIC_KEY_MODE)
-            if mode == 0:
-                self._state = True
-            else:
-                self._state = False
-
-            # Fetch the profile fan speeds.
-            self._fan_speed_home = int(
-                self._state_proxy.fetch_metric(
-                    ATTR_PROFILE_FAN_SPEED_HOME["metric_key"]
-                )
-            )
-            self._fan_speed_away = int(
-                self._state_proxy.fetch_metric(
-                    ATTR_PROFILE_FAN_SPEED_AWAY["metric_key"]
-                )
-            )
-            self._fan_speed_boost = int(
-                self._state_proxy.fetch_metric(
-                    ATTR_PROFILE_FAN_SPEED_BOOST["metric_key"]
-                )
-            )
-
-            self._available = True
-
-        except (OSError, KeyError) as err:
-            self._available = False
-            _LOGGER.error("Error updating fan: %s", err)
-
-    async def async_turn_on(self, speed: str = None, **kwargs) -> None:
+    @override
+    async def async_turn_on(
+        self,
+        percentage: int | None = None,
+        preset_mode: str | None = None,
+        **kwargs: Any,
+    ) -> None:
         """Turn the device on."""
-        _LOGGER.debug("Turn on: %s", speed)
-
-        # Only the case speed == None equals the GUI toggle switch being
-        # activated.
-        if speed is not None:
+        if percentage == 0:
+            await self.async_turn_off()
             return
 
-        if self._state is False:
-            try:
-                await self._client.set_values({METRIC_KEY_MODE: 0})
+        update_needed = False
 
-                # This state change affects other entities like sensors. Force
-                # an immediate update that can be observed by all parties
-                # involved.
-                await self._state_proxy.async_update(None)
+        try:
+            # Set speed before the preset. For a preset without a speed setting
+            # (e.g. Fireplace), set_fan_speed() raises before sending anything, so
+            # the call fails without changing the unit. And a unit goes straight
+            # to the new speed when the preset switches below.
+            if percentage is not None:
+                await self._async_set_percentage_internal(percentage, preset_mode)
+                update_needed = True
 
-            except OSError as err:
-                self._available = False
-                _LOGGER.error("Error turning on: %s", err)
-        else:
-            _LOGGER.error("Already on")
+            if preset_mode:
+                await self._async_set_preset_mode_internal(preset_mode)
+                update_needed = True
 
-    async def async_turn_off(self, **kwargs) -> None:
+            # Last, so the unit starts in its final profile and speed.
+            await self._async_set_power(True)
+            update_needed = True
+        finally:
+            if update_needed:
+                await self.coordinator.async_request_refresh()
+
+    @override
+    async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the device off."""
-        if self._state is True:
-            try:
-                await self._client.set_values({METRIC_KEY_MODE: 5})
+        await self._async_set_power(False)
+        await self.coordinator.async_request_refresh()
 
-                # Same as for turn_on method.
-                await self._state_proxy.async_update(None)
+    @override
+    async def async_set_percentage(self, percentage: int) -> None:
+        """Set the speed of the fan, as a percentage."""
+        if percentage == 0:
+            await self.async_turn_off()
+            return
 
-            except OSError as err:
-                self._available = False
-                _LOGGER.error("Error turning off: %s", err)
-        else:
-            _LOGGER.error("Already off")
+        await self._async_set_percentage_internal(percentage)
+        await self.coordinator.async_request_refresh()
+
+    async def _async_set_power(self, mode: bool) -> None:
+        try:
+            await self.coordinator.client.set_values(
+                {METRIC_KEY_MODE: MODE_ON if mode else MODE_OFF}
+            )
+        except ValloxApiException as err:
+            raise HomeAssistantError("Failed to set power mode") from err
+
+    async def _async_set_preset_mode_internal(self, preset_mode: str) -> None:
+        """Set new preset mode."""
+        try:
+            profile = PRESET_MODE_TO_VALLOX_PROFILE[preset_mode]
+            await self.coordinator.client.set_profile(profile)
+
+        except ValloxApiException as err:
+            raise HomeAssistantError(f"Failed to set profile: {preset_mode}") from err
+
+    async def _async_set_percentage_internal(
+        self, percentage: int, preset_mode: str | None = None
+    ) -> None:
+        """Set the fan speed of the given preset, or of the current profile."""
+        vallox_profile = (
+            PRESET_MODE_TO_VALLOX_PROFILE[preset_mode]
+            if preset_mode is not None
+            else self.coordinator.data.profile
+        )
+
+        try:
+            await self.coordinator.client.set_fan_speed(vallox_profile, percentage)
+        except ValloxInvalidInputException as err:
+            # The service schema limits the percentage to 0-100, so only the
+            # profile can be rejected here.
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="preset_without_fan_speed",
+                translation_placeholders={
+                    "preset_mode": VALLOX_PROFILE_TO_PRESET_MODE.get(
+                        vallox_profile, vallox_profile.name
+                    )
+                },
+            ) from err
+        except ValloxApiException as err:
+            raise HomeAssistantError("Failed to set fan speed") from err

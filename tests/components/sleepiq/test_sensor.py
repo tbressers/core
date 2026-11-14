@@ -1,66 +1,49 @@
 """The tests for SleepIQ sensor platform."""
-import unittest
+
 from unittest.mock import MagicMock
 
-import requests_mock
+import pytest
+from pytest_homeassistant.common import snapshot_platform
+from syrupy.assertion import SnapshotAssertion
 
-import homeassistant.components.sleepiq.sensor as sleepiq
-from homeassistant.setup import setup_component
+from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN
+from homeassistant.const import STATE_UNKNOWN
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 
-from tests.common import get_test_home_assistant
-from tests.components.sleepiq.test_init import mock_responses
+from .conftest import BED_NAME_LOWER, SLEEPER_L_NAME_LOWER, setup_platform
 
 
-class TestSleepIQSensorSetup(unittest.TestCase):
-    """Tests the SleepIQ Sensor platform."""
+async def test_sensors(
+    hass: HomeAssistant,
+    entity_registry: er.EntityRegistry,
+    mock_asyncsleepiq,
+    snapshot: SnapshotAssertion,
+) -> None:
+    """Test the SleepIQ sleepnumber for a bed with two sides."""
+    entry = await setup_platform(hass, SENSOR_DOMAIN)
 
-    DEVICES = []
+    await snapshot_platform(hass, entity_registry, snapshot, entry.entry_id)
 
-    def add_entities(self, devices):
-        """Mock add devices."""
-        for device in devices:
-            self.DEVICES.append(device)
 
-    def setUp(self):
-        """Initialize values for this testcase class."""
-        self.hass = get_test_home_assistant()
-        self.username = "foo"
-        self.password = "bar"
-        self.config = {"username": self.username, "password": self.password}
-        self.DEVICES = []
+@pytest.mark.parametrize(
+    "timezone",
+    [pytest.param(None, id="missing"), pytest.param("Not/AZone", id="invalid")],
+)
+async def test_session_times_without_bed_timezone(
+    hass: HomeAssistant,
+    mock_asyncsleepiq: MagicMock,
+    mock_bed: MagicMock,
+    timezone: str | None,
+) -> None:
+    """Test session times stay unknown when the bed time zone is not usable."""
+    mock_bed.timezone = timezone
+    await setup_platform(hass, SENSOR_DOMAIN)
 
-    def tearDown(self):  # pylint: disable=invalid-name
-        """Stop everything that was started."""
-        self.hass.stop()
-
-    @requests_mock.Mocker()
-    def test_setup(self, mock):
-        """Test for successfully setting up the SleepIQ platform."""
-        mock_responses(mock)
-
-        assert setup_component(self.hass, "sleepiq", {"sleepiq": self.config})
-
-        sleepiq.setup_platform(self.hass, self.config, self.add_entities, MagicMock())
-        assert 2 == len(self.DEVICES)
-
-        left_side = self.DEVICES[1]
-        assert "SleepNumber ILE Test1 SleepNumber" == left_side.name
-        assert 40 == left_side.state
-
-        right_side = self.DEVICES[0]
-        assert "SleepNumber ILE Test2 SleepNumber" == right_side.name
-        assert 80 == right_side.state
-
-    @requests_mock.Mocker()
-    def test_setup_sigle(self, mock):
-        """Test for successfully setting up the SleepIQ platform."""
-        mock_responses(mock, single=True)
-
-        assert setup_component(self.hass, "sleepiq", {"sleepiq": self.config})
-
-        sleepiq.setup_platform(self.hass, self.config, self.add_entities, MagicMock())
-        assert 1 == len(self.DEVICES)
-
-        right_side = self.DEVICES[0]
-        assert "SleepNumber ILE Test1 SleepNumber" == right_side.name
-        assert 40 == right_side.state
+    assert (
+        hass.states.get(
+            f"sensor.{BED_NAME_LOWER}_sleepnumber_{BED_NAME_LOWER}"
+            f"_{SLEEPER_L_NAME_LOWER}_bedtime"
+        ).state
+        == STATE_UNKNOWN
+    )

@@ -1,107 +1,182 @@
 """Support to select an option from a list."""
+
+from dataclasses import dataclass
 import logging
-import typing
+from typing import Any, cast, override
 
-import voluptuous as vol
+import probatio
 
+from homeassistant.components.select import (
+    ATTR_OPTION,
+    ATTR_OPTIONS,
+    SERVICE_SELECT_FIRST,
+    SERVICE_SELECT_LAST,
+    SERVICE_SELECT_NEXT,
+    SERVICE_SELECT_OPTION,
+    SERVICE_SELECT_PREVIOUS,
+)
 from homeassistant.const import (
-    ATTR_EDITABLE,
     CONF_ICON,
     CONF_ID,
     CONF_NAME,
+    CONF_OPTIONS,
     SERVICE_RELOAD,
 )
-from homeassistant.core import callback
-from homeassistant.helpers import collection
-import homeassistant.helpers.config_validation as cv
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import collection, config_validation as cv
 from homeassistant.helpers.entity_component import EntityComponent
-from homeassistant.helpers.restore_state import RestoreEntity
-import homeassistant.helpers.service
 from homeassistant.helpers.storage import Store
-from homeassistant.helpers.typing import ConfigType, HomeAssistantType, ServiceCallType
+from homeassistant.helpers.typing import ConfigType, VolDictType
+
+from .const import (
+    CONF_INITIAL,
+    DATA_INPUT_SELECT,
+    DOMAIN,
+    SERVICE_SET_OPTIONS,
+    InputSelectService,
+    InputSelectServiceArgument,
+)
+from .entity import InputSelect
+from .services import async_setup_services
 
 _LOGGER = logging.getLogger(__name__)
 
-DOMAIN = "input_select"
-
-CONF_INITIAL = "initial"
-CONF_OPTIONS = "options"
-
-ATTR_OPTION = "option"
-ATTR_OPTIONS = "options"
-
-SERVICE_SELECT_OPTION = "select_option"
-SERVICE_SELECT_NEXT = "select_next"
-SERVICE_SELECT_PREVIOUS = "select_previous"
-SERVICE_SET_OPTIONS = "set_options"
 STORAGE_KEY = DOMAIN
 STORAGE_VERSION = 1
+STORAGE_VERSION_MINOR = 2
 
-CREATE_FIELDS = {
-    vol.Required(CONF_NAME): vol.All(str, vol.Length(min=1)),
-    vol.Required(CONF_OPTIONS): vol.All(cv.ensure_list, vol.Length(min=1), [cv.string]),
-    vol.Optional(CONF_INITIAL): cv.string,
-    vol.Optional(CONF_ICON): cv.icon,
+__all__ = [
+    "ATTR_OPTION",
+    "ATTR_OPTIONS",
+    "DOMAIN",
+    "SERVICE_RELOAD",
+    "SERVICE_SELECT_FIRST",
+    "SERVICE_SELECT_LAST",
+    "SERVICE_SELECT_NEXT",
+    "SERVICE_SELECT_OPTION",
+    "SERVICE_SELECT_PREVIOUS",
+    "SERVICE_SET_OPTIONS",
+    "STORAGE_FIELDS",
+    "InputSelect",
+    "InputSelectService",
+    "InputSelectServiceArgument",
+]
+
+
+def _unique(options: Any) -> Any:
+    try:
+        return probatio.Unique()(options)
+    except probatio.Invalid as exc:
+        raise HomeAssistantError("Duplicate options are not allowed") from exc
+
+
+STORAGE_FIELDS: VolDictType = {
+    probatio.Required(CONF_NAME): probatio.All(str, probatio.NonEmpty()),
+    probatio.Required(CONF_OPTIONS): probatio.All(
+        probatio.EnsureList(), probatio.NonEmpty(), _unique, [cv.string]
+    ),
+    probatio.Optional(CONF_INITIAL): cv.string,
+    probatio.Optional(CONF_ICON): cv.icon,
 }
-UPDATE_FIELDS = {
-    vol.Optional(CONF_NAME): cv.string,
-    vol.Optional(CONF_OPTIONS): vol.All(cv.ensure_list, vol.Length(min=1), [cv.string]),
-    vol.Optional(CONF_INITIAL): cv.string,
-    vol.Optional(CONF_ICON): cv.icon,
-}
 
 
-def _cv_input_select(cfg):
-    """Configure validation helper for input select (voluptuous)."""
+def _remove_duplicates(options: list[str], name: str | None) -> list[str]:
+    """Remove duplicated options."""
+    unique_options = list(dict.fromkeys(options))
+    # This check was added in 2022.3
+    # Reject YAML configured input_select with duplicates from 2022.6
+    if len(unique_options) != len(options):
+        _LOGGER.warning(
+            (
+                "Input select '%s' with options %s had duplicated options, the"
+                " duplicates have been removed"
+            ),
+            name or "<unnamed>",
+            options,
+        )
+    return unique_options
+
+
+def _cv_input_select(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Configure validation helper for input select (probatio)."""
     options = cfg[CONF_OPTIONS]
     initial = cfg.get(CONF_INITIAL)
     if initial is not None and initial not in options:
-        raise vol.Invalid(
+        raise probatio.Invalid(
             f"initial state {initial} is not part of the options: {','.join(options)}"
         )
+    cfg[CONF_OPTIONS] = _remove_duplicates(options, cfg.get(CONF_NAME))
     return cfg
 
 
-CONFIG_SCHEMA = vol.Schema(
+CONFIG_SCHEMA = probatio.Schema(
     {
         DOMAIN: cv.schema_with_slug_keys(
-            vol.All(
+            probatio.All(
                 {
-                    vol.Optional(CONF_NAME): cv.string,
-                    vol.Required(CONF_OPTIONS): vol.All(
-                        cv.ensure_list, vol.Length(min=1), [cv.string]
+                    probatio.Optional(CONF_NAME): cv.string,
+                    probatio.Required(CONF_OPTIONS): probatio.All(
+                        probatio.EnsureList(), probatio.NonEmpty(), [cv.string]
                     ),
-                    vol.Optional(CONF_INITIAL): cv.string,
-                    vol.Optional(CONF_ICON): cv.icon,
+                    probatio.Optional(CONF_INITIAL): cv.string,
+                    probatio.Optional(CONF_ICON): cv.icon,
                 },
                 _cv_input_select,
             )
         )
     },
-    extra=vol.ALLOW_EXTRA,
+    extra=probatio.ALLOW_EXTRA,
 )
-RELOAD_SERVICE_SCHEMA = vol.Schema({})
 
 
-async def async_setup(hass: HomeAssistantType, config: ConfigType) -> bool:
+class InputSelectStore(Store):
+    """Store entity registry data."""
+
+    @override
+    async def _async_migrate_func(
+        self, old_major_version: int, old_minor_version: int, old_data: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Migrate to the new version."""
+        if old_major_version == 1:
+            if old_minor_version < 2:
+                for item in old_data["items"]:
+                    options = item[ATTR_OPTIONS]
+                    item[ATTR_OPTIONS] = _remove_duplicates(
+                        options, item.get(CONF_NAME)
+                    )
+        return old_data
+
+
+@dataclass(slots=True)
+class InputSelectData:
+    """Runtime data for the input_select integration."""
+
+    component: EntityComponent[InputSelect]
+    yaml_collection: collection.YamlCollection
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up an input select."""
-    component = EntityComponent(_LOGGER, DOMAIN, hass)
+    component = EntityComponent[InputSelect](_LOGGER, DOMAIN, hass)
+
     id_manager = collection.IDManager()
 
     yaml_collection = collection.YamlCollection(
         logging.getLogger(f"{__name__}.yaml_collection"), id_manager
     )
-    collection.attach_entity_component_collection(
-        component, yaml_collection, InputSelect.from_yaml
+    collection.sync_entity_lifecycle(
+        hass, DOMAIN, DOMAIN, component, yaml_collection, InputSelect
     )
 
     storage_collection = InputSelectStorageCollection(
-        Store(hass, STORAGE_VERSION, STORAGE_KEY),
-        logging.getLogger(f"{__name__}.storage_collection"),
+        InputSelectStore(
+            hass, STORAGE_VERSION, STORAGE_KEY, minor_version=STORAGE_VERSION_MINOR
+        ),
         id_manager,
     )
-    collection.attach_entity_component_collection(
-        component, storage_collection, InputSelect
+    collection.sync_entity_lifecycle(
+        hass, DOMAIN, DOMAIN, component, storage_collection, InputSelect
     )
 
     await yaml_collection.async_load(
@@ -109,175 +184,38 @@ async def async_setup(hass: HomeAssistantType, config: ConfigType) -> bool:
     )
     await storage_collection.async_load()
 
-    collection.StorageCollectionWebsocket(
-        storage_collection, DOMAIN, DOMAIN, CREATE_FIELDS, UPDATE_FIELDS
+    collection.DictStorageCollectionWebsocket(
+        storage_collection, DOMAIN, DOMAIN, STORAGE_FIELDS, STORAGE_FIELDS
     ).async_setup(hass)
 
-    collection.attach_entity_registry_cleaner(hass, DOMAIN, DOMAIN, yaml_collection)
-    collection.attach_entity_registry_cleaner(hass, DOMAIN, DOMAIN, storage_collection)
+    hass.data[DATA_INPUT_SELECT] = InputSelectData(component, yaml_collection)
 
-    async def reload_service_handler(service_call: ServiceCallType) -> None:
-        """Reload yaml entities."""
-        conf = await component.async_prepare_reload(skip_reset=True)
-        if conf is None:
-            conf = {DOMAIN: {}}
-        await yaml_collection.async_load(
-            [{CONF_ID: id_, **cfg} for id_, cfg in conf.get(DOMAIN, {}).items()]
-        )
-
-    homeassistant.helpers.service.async_register_admin_service(
-        hass,
-        DOMAIN,
-        SERVICE_RELOAD,
-        reload_service_handler,
-        schema=RELOAD_SERVICE_SCHEMA,
-    )
-
-    component.async_register_entity_service(
-        SERVICE_SELECT_OPTION,
-        {vol.Required(ATTR_OPTION): cv.string},
-        "async_select_option",
-    )
-
-    component.async_register_entity_service(
-        SERVICE_SELECT_NEXT,
-        {},
-        callback(lambda entity, call: entity.async_offset_index(1)),
-    )
-
-    component.async_register_entity_service(
-        SERVICE_SELECT_PREVIOUS,
-        {},
-        callback(lambda entity, call: entity.async_offset_index(-1)),
-    )
-
-    component.async_register_entity_service(
-        SERVICE_SET_OPTIONS,
-        {
-            vol.Required(ATTR_OPTIONS): vol.All(
-                cv.ensure_list, vol.Length(min=1), [cv.string]
-            )
-        },
-        "async_set_options",
-    )
-
+    async_setup_services(hass)
     return True
 
 
-class InputSelectStorageCollection(collection.StorageCollection):
+class InputSelectStorageCollection(collection.DictStorageCollection):
     """Input storage based collection."""
 
-    CREATE_SCHEMA = vol.Schema(vol.All(CREATE_FIELDS, _cv_input_select))
-    UPDATE_SCHEMA = vol.Schema(UPDATE_FIELDS)
+    CREATE_UPDATE_SCHEMA = probatio.Schema(
+        probatio.All(STORAGE_FIELDS, _cv_input_select)
+    )
 
-    async def _process_create_data(self, data: typing.Dict) -> typing.Dict:
+    @override
+    async def _process_create_data(self, data: dict[str, Any]) -> dict[str, Any]:
         """Validate the config is valid."""
-        return self.CREATE_SCHEMA(data)
+        return cast(dict[str, Any], self.CREATE_UPDATE_SCHEMA(data))
 
     @callback
-    def _get_suggested_id(self, info: typing.Dict) -> str:
+    @override
+    def _get_suggested_id(self, info: dict[str, Any]) -> str:
         """Suggest an ID based on the config."""
-        return info[CONF_NAME]
+        return cast(str, info[CONF_NAME])
 
-    async def _update_data(self, data: dict, update_data: typing.Dict) -> typing.Dict:
+    @override
+    async def _update_data(
+        self, item: dict[str, Any], update_data: dict[str, Any]
+    ) -> dict[str, Any]:
         """Return a new updated data object."""
-        update_data = self.UPDATE_SCHEMA(update_data)
-        return _cv_input_select({**data, **update_data})
-
-
-class InputSelect(RestoreEntity):
-    """Representation of a select input."""
-
-    def __init__(self, config: typing.Dict):
-        """Initialize a select input."""
-        self._config = config
-        self.editable = True
-        self._current_option = config.get(CONF_INITIAL)
-
-    @classmethod
-    def from_yaml(cls, config: typing.Dict) -> "InputSelect":
-        """Return entity instance initialized from yaml storage."""
-        input_select = cls(config)
-        input_select.entity_id = f"{DOMAIN}.{config[CONF_ID]}"
-        input_select.editable = False
-        return input_select
-
-    async def async_added_to_hass(self):
-        """Run when entity about to be added."""
-        await super().async_added_to_hass()
-        if self._current_option is not None:
-            return
-
-        state = await self.async_get_last_state()
-        if not state or state.state not in self._options:
-            self._current_option = self._options[0]
-        else:
-            self._current_option = state.state
-
-    @property
-    def should_poll(self):
-        """If entity should be polled."""
-        return False
-
-    @property
-    def name(self):
-        """Return the name of the select input."""
-        return self._config.get(CONF_NAME)
-
-    @property
-    def icon(self):
-        """Return the icon to be used for this entity."""
-        return self._config.get(CONF_ICON)
-
-    @property
-    def _options(self) -> typing.List[str]:
-        """Return a list of selection options."""
-        return self._config[CONF_OPTIONS]
-
-    @property
-    def state(self):
-        """Return the state of the component."""
-        return self._current_option
-
-    @property
-    def state_attributes(self):
-        """Return the state attributes."""
-        return {ATTR_OPTIONS: self._config[ATTR_OPTIONS], ATTR_EDITABLE: self.editable}
-
-    @property
-    def unique_id(self) -> typing.Optional[str]:
-        """Return unique id for the entity."""
-        return self._config[CONF_ID]
-
-    @callback
-    def async_select_option(self, option):
-        """Select new option."""
-        if option not in self._options:
-            _LOGGER.warning(
-                "Invalid option: %s (possible options: %s)",
-                option,
-                ", ".join(self._options),
-            )
-            return
-        self._current_option = option
-        self.async_write_ha_state()
-
-    @callback
-    def async_offset_index(self, offset):
-        """Offset current index."""
-        current_index = self._options.index(self._current_option)
-        new_index = (current_index + offset) % len(self._options)
-        self._current_option = self._options[new_index]
-        self.async_write_ha_state()
-
-    @callback
-    def async_set_options(self, options):
-        """Set options."""
-        self._current_option = options[0]
-        self._config[CONF_OPTIONS] = options
-        self.async_write_ha_state()
-
-    async def async_update_config(self, config: typing.Dict) -> None:
-        """Handle when the config is updated."""
-        self._config = config
-        self.async_write_ha_state()
+        update_data = self.CREATE_UPDATE_SCHEMA(update_data)
+        return {CONF_ID: item[CONF_ID]} | update_data

@@ -1,58 +1,61 @@
 """Support for Vera switches."""
-import logging
 
-from homeassistant.components.switch import ENTITY_ID_FORMAT, SwitchDevice
-from homeassistant.util import convert
+from typing import Any, override
 
-from . import VERA_CONTROLLER, VERA_DEVICES, VeraDevice
+import pyvera as veraApi
 
-_LOGGER = logging.getLogger(__name__)
+from homeassistant.components.switch import SwitchEntity
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+
+from .common import ControllerData, VeraConfigEntry
+from .entity import VeraEntity
 
 
-def setup_platform(hass, config, add_entities, discovery_info=None):
-    """Set up the Vera switches."""
-    add_entities(
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: VeraConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up the sensor config entry."""
+    controller_data = entry.runtime_data
+    async_add_entities(
         [
-            VeraSwitch(device, hass.data[VERA_CONTROLLER])
-            for device in hass.data[VERA_DEVICES]["switch"]
+            VeraSwitch(device, controller_data)
+            for device in controller_data.devices[Platform.SWITCH]
         ],
         True,
     )
 
 
-class VeraSwitch(VeraDevice, SwitchDevice):
+class VeraSwitch(VeraEntity[veraApi.VeraSwitch], SwitchEntity):
     """Representation of a Vera Switch."""
 
-    def __init__(self, vera_device, controller):
-        """Initialize the Vera device."""
-        self._state = False
-        VeraDevice.__init__(self, vera_device, controller)
-        self.entity_id = ENTITY_ID_FORMAT.format(self.vera_id)
+    _attr_is_on = False
 
-    def turn_on(self, **kwargs):
+    def __init__(
+        self, vera_device: veraApi.VeraSwitch, controller_data: ControllerData
+    ) -> None:
+        """Initialize the Vera device."""
+        VeraEntity.__init__(self, vera_device, controller_data)
+
+    @override
+    def turn_on(self, **kwargs: Any) -> None:
         """Turn device on."""
         self.vera_device.switch_on()
-        self._state = True
+        self._attr_is_on = True
         self.schedule_update_ha_state()
 
-    def turn_off(self, **kwargs):
+    @override
+    def turn_off(self, **kwargs: Any) -> None:
         """Turn device off."""
         self.vera_device.switch_off()
-        self._state = False
+        self._attr_is_on = False
         self.schedule_update_ha_state()
 
-    @property
-    def current_power_w(self):
-        """Return the current power usage in W."""
-        power = self.vera_device.power
-        if power:
-            return convert(power, float, 0.0)
-
-    @property
-    def is_on(self):
-        """Return true if device is on."""
-        return self._state
-
-    def update(self):
+    @override
+    def update(self) -> None:
         """Update device state."""
-        self._state = self.vera_device.is_switched_on()
+        super().update()
+        self._attr_is_on = self.vera_device.is_switched_on()

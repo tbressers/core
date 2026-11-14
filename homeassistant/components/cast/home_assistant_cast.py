@@ -1,73 +1,44 @@
 """Home Assistant Cast integration for Cast."""
-from typing import Optional
 
-from pychromecast.controllers.homeassistant import HomeAssistantController
-import voluptuous as vol
+from typing import TYPE_CHECKING
 
-from homeassistant import auth, config_entries, core
-from homeassistant.const import ATTR_ENTITY_ID
-from homeassistant.helpers import config_validation as cv, dispatcher
+from homeassistant import auth, core
 
-from .const import DOMAIN, SIGNAL_HASS_CAST_SHOW_VIEW
+if TYPE_CHECKING:
+    from . import CastConfigEntry
 
-SERVICE_SHOW_VIEW = "show_lovelace_view"
-ATTR_VIEW_PATH = "view_path"
+CAST_USER_NAME = "Home Assistant Cast"
 
 
-async def async_setup_ha_cast(
-    hass: core.HomeAssistant, entry: config_entries.ConfigEntry
-):
-    """Set up Home Assistant Cast."""
-    user_id: Optional[str] = entry.data.get("user_id")
-    user: Optional[auth.models.User] = None
+async def async_setup_ha_cast(hass: core.HomeAssistant, entry: CastConfigEntry) -> str:
+    """Set up Home Assistant Cast and return its refresh token."""
+    user_id: str | None = entry.data.get("user_id")
+    user: auth.models.User | None = None
 
     if user_id is not None:
         user = await hass.auth.async_get_user(user_id)
 
     if user is None:
         user = await hass.auth.async_create_system_user(
-            "Home Assistant Cast", [auth.GROUP_ID_ADMIN]
+            CAST_USER_NAME, group_ids=[auth.const.GROUP_ID_USER]
         )
         hass.config_entries.async_update_entry(
             entry, data={**entry.data, "user_id": user.id}
         )
+    elif user.is_admin:
+        await hass.auth.async_update_user(user, group_ids=[auth.const.GROUP_ID_USER])
 
     if user.refresh_tokens:
         refresh_token: auth.models.RefreshToken = list(user.refresh_tokens.values())[0]
     else:
         refresh_token = await hass.auth.async_create_refresh_token(user)
 
-    async def handle_show_view(call: core.ServiceCall):
-        """Handle a Show View service call."""
-        hass_url = hass.config.api.base_url
+    return refresh_token.token
 
-        # Home Assistant Cast only works with https urls. If user has no configured
-        # base url, use their remote url.
-        if not hass_url.lower().startswith("https://"):
-            try:
-                hass_url = hass.components.cloud.async_remote_ui_url()
-            except hass.components.cloud.CloudNotAvailable:
-                pass
 
-        controller = HomeAssistantController(
-            # If you are developing Home Assistant Cast, uncomment and set to your dev app id.
-            # app_id="5FE44367",
-            hass_url=hass_url,
-            client_id=None,
-            refresh_token=refresh_token.token,
-        )
+async def async_remove_user(hass: core.HomeAssistant, entry: CastConfigEntry) -> None:
+    """Remove Home Assistant Cast user."""
+    user_id: str | None = entry.data.get("user_id")
 
-        dispatcher.async_dispatcher_send(
-            hass,
-            SIGNAL_HASS_CAST_SHOW_VIEW,
-            controller,
-            call.data[ATTR_ENTITY_ID],
-            call.data[ATTR_VIEW_PATH],
-        )
-
-    hass.helpers.service.async_register_admin_service(
-        DOMAIN,
-        SERVICE_SHOW_VIEW,
-        handle_show_view,
-        vol.Schema({ATTR_ENTITY_ID: cv.entity_id, ATTR_VIEW_PATH: str}),
-    )
+    if user_id is not None and (user := await hass.auth.async_get_user(user_id)):
+        await hass.auth.async_remove_user(user)

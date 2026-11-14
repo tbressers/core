@@ -1,15 +1,22 @@
 """Support for the voicerss speech service."""
+
 import asyncio
+from http import HTTPStatus
 import logging
+from typing import TYPE_CHECKING, Any, override
 
 import aiohttp
-import async_timeout
-import voluptuous as vol
+import probatio
 
-from homeassistant.components.tts import CONF_LANG, PLATFORM_SCHEMA, Provider
+from homeassistant.components.tts import (
+    CONF_LANG,
+    PLATFORM_SCHEMA as TTS_PLATFORM_SCHEMA,
+    Provider,
+    TtsAudioType,
+)
 from homeassistant.const import CONF_API_KEY
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-import homeassistant.helpers.config_validation as cv
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -28,35 +35,58 @@ ERROR_MSG = [
 ]
 
 SUPPORT_LANGUAGES = [
+    "ar-eg",
+    "ar-sa",
+    "bg-bg",
     "ca-es",
     "zh-cn",
     "zh-hk",
     "zh-tw",
+    "hr-hr",
+    "cs-cz",
     "da-dk",
+    "nl-be",
     "nl-nl",
     "en-au",
     "en-ca",
     "en-gb",
     "en-in",
+    "en-ie",
     "en-us",
     "fi-fi",
     "fr-ca",
     "fr-fr",
+    "fr-ch",
+    "de-at",
     "de-de",
+    "de-ch",
+    "el-gr",
+    "he-il",
+    "hi-in",
+    "hu-hu",
+    "id-id",
     "it-it",
     "ja-jp",
     "ko-kr",
+    "ms-my",
     "nb-no",
     "pl-pl",
     "pt-br",
     "pt-pt",
+    "ro-ro",
     "ru-ru",
+    "sk-sk",
+    "sl-si",
     "es-mx",
     "es-es",
     "sv-se",
+    "ta-in",
+    "th-th",
+    "tr-tr",
+    "vi-vn",
 ]
 
-SUPPORT_CODECS = ["mp3", "wav", "aac", "ogg", "caf"]
+SUPPORT_CODECS = ["mp3", "wav", "aac", "ogg", "caf"]  # codespell:ignore caf
 
 SUPPORT_FORMATS = [
     "8khz_8bit_mono",
@@ -121,12 +151,18 @@ DEFAULT_CODEC = "mp3"
 DEFAULT_FORMAT = "8khz_8bit_mono"
 
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = TTS_PLATFORM_SCHEMA.extend(
     {
-        vol.Required(CONF_API_KEY): cv.string,
-        vol.Optional(CONF_LANG, default=DEFAULT_LANG): vol.In(SUPPORT_LANGUAGES),
-        vol.Optional(CONF_CODEC, default=DEFAULT_CODEC): vol.In(SUPPORT_CODECS),
-        vol.Optional(CONF_FORMAT, default=DEFAULT_FORMAT): vol.In(SUPPORT_FORMATS),
+        probatio.Required(probatio.Secret(CONF_API_KEY)): cv.string,
+        probatio.Optional(CONF_LANG, default=DEFAULT_LANG): probatio.In(
+            SUPPORT_LANGUAGES
+        ),
+        probatio.Optional(CONF_CODEC, default=DEFAULT_CODEC): probatio.In(
+            SUPPORT_CODECS
+        ),
+        probatio.Optional(CONF_FORMAT, default=DEFAULT_FORMAT): probatio.In(
+            SUPPORT_FORMATS
+        ),
     }
 )
 
@@ -154,17 +190,24 @@ class VoiceRSSProvider(Provider):
         }
 
     @property
-    def default_language(self):
+    @override
+    def default_language(self) -> str:
         """Return the default language."""
         return self._lang
 
     @property
-    def supported_languages(self):
+    @override
+    def supported_languages(self) -> list[str]:
         """Return list of supported languages."""
         return SUPPORT_LANGUAGES
 
-    async def async_get_tts_audio(self, message, language, options=None):
+    @override
+    async def async_get_tts_audio(
+        self, message: str, language: str, options: dict[str, Any]
+    ) -> TtsAudioType:
         """Load TTS from VoiceRSS."""
+        if TYPE_CHECKING:
+            assert self.hass
         websession = async_get_clientsession(self.hass)
         form_data = self._form_data.copy()
 
@@ -172,12 +215,12 @@ class VoiceRSSProvider(Provider):
         form_data["hl"] = language
 
         try:
-            with async_timeout.timeout(10):
+            async with asyncio.timeout(10):
                 request = await websession.post(VOICERSS_API_URL, data=form_data)
 
-                if request.status != 200:
+                if request.status != HTTPStatus.OK:
                     _LOGGER.error(
-                        "Error %d on load url %s.", request.status, request.url
+                        "Error %d on load url %s", request.status, request.url
                     )
                     return (None, None)
                 data = await request.read()
@@ -186,7 +229,7 @@ class VoiceRSSProvider(Provider):
                     _LOGGER.error("Error receive %s from VoiceRSS", str(data, "utf-8"))
                     return (None, None)
 
-        except (asyncio.TimeoutError, aiohttp.ClientError):
+        except TimeoutError, aiohttp.ClientError:
             _LOGGER.error("Timeout for VoiceRSS API")
             return (None, None)
 

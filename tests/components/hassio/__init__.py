@@ -1,3 +1,3 @@
-"""Tests for Hass.io component."""
+"""Tests for the Supervisor integration."""
 
-HASSIO_TOKEN = "123456"
+SUPERVISOR_TOKEN = "123456"

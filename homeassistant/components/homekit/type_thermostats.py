@@ -1,117 +1,184 @@
 """Class to hold all thermostat accessories."""
+
 import logging
+from typing import Any, override
 
 from pyhap.const import CATEGORY_THERMOSTAT
 
-from homeassistant.components.climate.const import (
-    ATTR_CURRENT_TEMPERATURE,
-    ATTR_HVAC_ACTION,
-    ATTR_HVAC_MODE,
-    ATTR_HVAC_MODES,
-    ATTR_MAX_TEMP,
-    ATTR_MIN_TEMP,
-    ATTR_TARGET_TEMP_HIGH,
-    ATTR_TARGET_TEMP_LOW,
-    ATTR_TARGET_TEMP_STEP,
-    CURRENT_HVAC_COOL,
-    CURRENT_HVAC_HEAT,
-    CURRENT_HVAC_IDLE,
-    CURRENT_HVAC_OFF,
-    DEFAULT_MAX_TEMP,
-    DEFAULT_MIN_TEMP,
-    DOMAIN as DOMAIN_CLIMATE,
-    HVAC_MODE_AUTO,
-    HVAC_MODE_COOL,
-    HVAC_MODE_FAN_ONLY,
-    HVAC_MODE_HEAT,
-    HVAC_MODE_HEAT_COOL,
-    HVAC_MODE_OFF,
-    SERVICE_SET_HVAC_MODE as SERVICE_SET_HVAC_MODE_THERMOSTAT,
-    SERVICE_SET_TEMPERATURE as SERVICE_SET_TEMPERATURE_THERMOSTAT,
-    SUPPORT_TARGET_TEMPERATURE_RANGE,
+from homeassistant.components.climate import (
+    DEFAULT_MAX_HUMIDITY,
+    DEFAULT_MIN_HUMIDITY,
+    DOMAIN as CLIMATE_DOMAIN,
+    FAN_AUTO,
+    FAN_ON,
+    ClimateEntityCapabilityAttribute,
+    ClimateEntityFeature,
+    ClimateEntityStateAttribute,
+    ClimateService,
+    ClimateServiceArgument,
+    HVACAction,
+    HVACMode,
 )
 from homeassistant.components.water_heater import (
-    DOMAIN as DOMAIN_WATER_HEATER,
-    SERVICE_SET_TEMPERATURE as SERVICE_SET_TEMPERATURE_WATER_HEATER,
+    DOMAIN as WATER_HEATER_DOMAIN,
+    WaterHeaterCapabilityAttribute,
+    WaterHeaterEntityFeature,
+    WaterHeaterService,
+    WaterHeaterServiceArgument,
+    WaterHeaterStateAttribute,
 )
 from homeassistant.const import (
     ATTR_ENTITY_ID,
-    ATTR_SUPPORTED_FEATURES,
-    ATTR_TEMPERATURE,
-    TEMP_CELSIUS,
-    TEMP_FAHRENHEIT,
+    PERCENTAGE,
+    STATE_OFF,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
+    EntityStateAttribute,
+    UnitOfTemperature,
 )
+from homeassistant.core import State, callback
+from homeassistant.util.enum import try_parse_enum
 
-from . import TYPES
-from .accessories import HomeAccessory, debounce
+from .accessories import TYPES, HomeAccessory
+from .climate_base import HomeKitClimateAccessory
+from .climate_util import (
+    get_temperature_range_from_state,
+    temperature_attribute_to_homekit,
+)
 from .const import (
     CHAR_COOLING_THRESHOLD_TEMPERATURE,
+    CHAR_CURRENT_FAN_STATE,
     CHAR_CURRENT_HEATING_COOLING,
+    CHAR_CURRENT_HUMIDITY,
     CHAR_CURRENT_TEMPERATURE,
     CHAR_HEATING_THRESHOLD_TEMPERATURE,
+    CHAR_ROTATION_SPEED,
+    CHAR_SWING_MODE,
+    CHAR_TARGET_FAN_STATE,
     CHAR_TARGET_HEATING_COOLING,
+    CHAR_TARGET_HUMIDITY,
     CHAR_TARGET_TEMPERATURE,
     CHAR_TEMP_DISPLAY_UNITS,
     DEFAULT_MAX_TEMP_WATER_HEATER,
     DEFAULT_MIN_TEMP_WATER_HEATER,
     PROP_MAX_VALUE,
-    PROP_MIN_STEP,
     PROP_MIN_VALUE,
     SERV_THERMOSTAT,
 )
-from .util import temperature_to_homekit, temperature_to_states
+from .util import get_min_max, temperature_to_states
 
 _LOGGER = logging.getLogger(__name__)
 
-HC_HOMEKIT_VALID_MODES_WATER_HEATER = {
-    "Heat": 1,
-}
-UNIT_HASS_TO_HOMEKIT = {TEMP_CELSIUS: 0, TEMP_FAHRENHEIT: 1}
+DEFAULT_HVAC_MODES = [
+    HVACMode.HEAT,
+    HVACMode.COOL,
+    HVACMode.HEAT_COOL,
+    HVACMode.OFF,
+]
+
+HC_HOMEKIT_VALID_MODES_WATER_HEATER = {"Heat": 1}
+UNIT_HASS_TO_HOMEKIT = {UnitOfTemperature.CELSIUS: 0, UnitOfTemperature.FAHRENHEIT: 1}
+
+HC_HEAT_COOL_OFF = 0
+HC_HEAT_COOL_HEAT = 1
+HC_HEAT_COOL_COOL = 2
+HC_HEAT_COOL_AUTO = 3
+
+HC_HEAT_COOL_PREFER_HEAT = [
+    HC_HEAT_COOL_AUTO,
+    HC_HEAT_COOL_HEAT,
+    HC_HEAT_COOL_COOL,
+    HC_HEAT_COOL_OFF,
+]
+
+HC_HEAT_COOL_PREFER_COOL = [
+    HC_HEAT_COOL_AUTO,
+    HC_HEAT_COOL_COOL,
+    HC_HEAT_COOL_HEAT,
+    HC_HEAT_COOL_OFF,
+]
+
+HC_MIN_TEMP = 10
+HC_MAX_TEMP = 38
+
 UNIT_HOMEKIT_TO_HASS = {c: s for s, c in UNIT_HASS_TO_HOMEKIT.items()}
 HC_HASS_TO_HOMEKIT = {
-    HVAC_MODE_OFF: 0,
-    HVAC_MODE_HEAT: 1,
-    HVAC_MODE_COOL: 2,
-    HVAC_MODE_AUTO: 3,
-    HVAC_MODE_HEAT_COOL: 3,
-    HVAC_MODE_FAN_ONLY: 2,
+    HVACMode.OFF: HC_HEAT_COOL_OFF,
+    HVACMode.HEAT: HC_HEAT_COOL_HEAT,
+    HVACMode.COOL: HC_HEAT_COOL_COOL,
+    HVACMode.AUTO: HC_HEAT_COOL_AUTO,
+    HVACMode.HEAT_COOL: HC_HEAT_COOL_AUTO,
+    HVACMode.DRY: HC_HEAT_COOL_COOL,
+    HVACMode.FAN_ONLY: HC_HEAT_COOL_COOL,
 }
 HC_HOMEKIT_TO_HASS = {c: s for s, c in HC_HASS_TO_HOMEKIT.items()}
 
 HC_HASS_TO_HOMEKIT_ACTION = {
-    CURRENT_HVAC_OFF: 0,
-    CURRENT_HVAC_IDLE: 0,
-    CURRENT_HVAC_HEAT: 1,
-    CURRENT_HVAC_COOL: 2,
+    HVACAction.OFF: HC_HEAT_COOL_OFF,
+    HVACAction.IDLE: HC_HEAT_COOL_OFF,
+    HVACAction.HEATING: HC_HEAT_COOL_HEAT,
+    HVACAction.COOLING: HC_HEAT_COOL_COOL,
+    HVACAction.DRYING: HC_HEAT_COOL_COOL,
+    HVACAction.FAN: HC_HEAT_COOL_COOL,
+    HVACAction.PREHEATING: HC_HEAT_COOL_HEAT,
+    HVACAction.DEFROSTING: HC_HEAT_COOL_HEAT,
 }
 
 
+def _hk_hvac_mode_from_state(state: State) -> int | None:
+    """Return the equivalent HomeKit HVAC mode for a given state."""
+    if (current_state := state.state) in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+        return None
+    if not (hvac_mode := try_parse_enum(HVACMode, current_state)):
+        _LOGGER.error(
+            "%s: Received invalid HVAC mode: %s", state.entity_id, state.state
+        )
+        return None
+    return HC_HASS_TO_HOMEKIT.get(hvac_mode)
+
+
 @TYPES.register("Thermostat")
-class Thermostat(HomeAccessory):
+class Thermostat(HomeKitClimateAccessory):
     """Generate a Thermostat accessory for a climate."""
 
-    def __init__(self, *args):
+    def __init__(self, *args: Any) -> None:
         """Initialize a Thermostat accessory object."""
-        super().__init__(*args, category=CATEGORY_THERMOSTAT)
-        self._unit = self.hass.config.units.temperature_unit
-        self._flag_heat_cool = False
-        self._flag_temperature = False
-        self._flag_coolingthresh = False
-        self._flag_heatingthresh = False
-        min_temp, max_temp = self.get_temperature_range()
-        temp_step = self.hass.states.get(self.entity_id).attributes.get(
-            ATTR_TARGET_TEMP_STEP, 0.5
+        super().__init__(*args)
+        state = self.hass.states.get(self.entity_id)
+        assert state
+        hc_min_temp, hc_max_temp = self.get_temperature_range(state)
+        # The common climate reload attributes are added by the base class.
+        self._reload_on_change_attrs.append(
+            ClimateEntityCapabilityAttribute.MIN_HUMIDITY
         )
 
         # Add additional characteristics if auto mode is supported
-        self.chars = []
-        state = self.hass.states.get(self.entity_id)
-        features = state.attributes.get(ATTR_SUPPORTED_FEATURES, 0)
+        self.chars: list[str] = []
 
-        if features & SUPPORT_TARGET_TEMPERATURE_RANGE:
+        attributes = state.attributes
+        min_humidity, _ = get_min_max(
+            attributes.get(
+                ClimateEntityCapabilityAttribute.MIN_HUMIDITY, DEFAULT_MIN_HUMIDITY
+            ),
+            attributes.get(
+                ClimateEntityCapabilityAttribute.MAX_HUMIDITY, DEFAULT_MAX_HUMIDITY
+            ),
+        )
+        features = attributes.get(EntityStateAttribute.SUPPORTED_FEATURES, 0)
+
+        if features & ClimateEntityFeature.TARGET_TEMPERATURE_RANGE:
             self.chars.extend(
                 (CHAR_COOLING_THRESHOLD_TEMPERATURE, CHAR_HEATING_THRESHOLD_TEMPERATURE)
             )
+
+        if (
+            ClimateEntityStateAttribute.CURRENT_HUMIDITY in attributes
+            or features & ClimateEntityFeature.TARGET_HUMIDITY
+        ):
+            self.chars.append(CHAR_CURRENT_HUMIDITY)
+
+        if features & ClimateEntityFeature.TARGET_HUMIDITY:
+            self.chars.append(CHAR_TARGET_HUMIDITY)
 
         serv_thermostat = self.add_preload_service(SERV_THERMOSTAT, self.chars)
 
@@ -120,54 +187,23 @@ class Thermostat(HomeAccessory):
             CHAR_CURRENT_HEATING_COOLING, value=0
         )
 
-        # Target mode characteristics
-        hc_modes = state.attributes.get(ATTR_HVAC_MODES, None)
-        if hc_modes is None:
-            _LOGGER.error(
-                "%s: HVAC modes not yet available. Please disable auto start for homekit.",
-                self.entity_id,
-            )
-            hc_modes = (
-                HVAC_MODE_HEAT,
-                HVAC_MODE_COOL,
-                HVAC_MODE_HEAT_COOL,
-                HVAC_MODE_OFF,
-            )
-
-        # determine available modes for this entity, prefer AUTO over HEAT_COOL and COOL over FAN_ONLY
-        self.hc_homekit_to_hass = {
-            c: s
-            for s, c in HC_HASS_TO_HOMEKIT.items()
-            if (
-                s in hc_modes
-                and not (
-                    (s == HVAC_MODE_HEAT_COOL and HVAC_MODE_AUTO in hc_modes)
-                    or (s == HVAC_MODE_FAN_ONLY and HVAC_MODE_COOL in hc_modes)
-                )
-            )
-        }
-        hc_valid_values = {k: v for v, k in self.hc_homekit_to_hass.items()}
-
-        self.char_target_heat_cool = serv_thermostat.configure_char(
+        self._configure_hvac_modes(state)
+        self.char_target_heat_cool = self._configure_target_mode_char(
+            serv_thermostat,
             CHAR_TARGET_HEATING_COOLING,
-            value=0,
-            setter_callback=self.set_heat_cool,
-            valid_values=hc_valid_values,
+            list(self.hc_homekit_to_hass)[0],
+            self.hc_hass_to_homekit,
         )
 
-        # Current and target temperature characteristics
-        self.char_current_temp = serv_thermostat.configure_char(
-            CHAR_CURRENT_TEMPERATURE, value=21.0
-        )
+        self._configure_current_temperature_char(serv_thermostat)
+
         self.char_target_temp = serv_thermostat.configure_char(
             CHAR_TARGET_TEMPERATURE,
             value=21.0,
-            properties={
-                PROP_MIN_VALUE: min_temp,
-                PROP_MAX_VALUE: max_temp,
-                PROP_MIN_STEP: temp_step,
-            },
-            setter_callback=self.set_target_temperature,
+            # We do not set PROP_MIN_STEP here and instead use the HomeKit
+            # default of 0.1 in order to have enough precision to convert
+            # temperature units and avoid setting to 73F will result in 74F
+            properties={PROP_MIN_VALUE: hc_min_temp, PROP_MAX_VALUE: hc_max_temp},
         )
 
         # Display units characteristic
@@ -182,175 +218,358 @@ class Thermostat(HomeAccessory):
             self.char_cooling_thresh_temp = serv_thermostat.configure_char(
                 CHAR_COOLING_THRESHOLD_TEMPERATURE,
                 value=23.0,
-                properties={
-                    PROP_MIN_VALUE: min_temp,
-                    PROP_MAX_VALUE: max_temp,
-                    PROP_MIN_STEP: temp_step,
-                },
-                setter_callback=self.set_cooling_threshold,
+                # We do not set PROP_MIN_STEP here and instead use the HomeKit
+                # default of 0.1 in order to have enough precision to convert
+                # temperature units and avoid setting to 73F will result in 74F
+                properties={PROP_MIN_VALUE: hc_min_temp, PROP_MAX_VALUE: hc_max_temp},
             )
         if CHAR_HEATING_THRESHOLD_TEMPERATURE in self.chars:
             self.char_heating_thresh_temp = serv_thermostat.configure_char(
                 CHAR_HEATING_THRESHOLD_TEMPERATURE,
                 value=19.0,
-                properties={
-                    PROP_MIN_VALUE: min_temp,
-                    PROP_MAX_VALUE: max_temp,
-                    PROP_MIN_STEP: temp_step,
-                },
-                setter_callback=self.set_heating_threshold,
+                # We do not set PROP_MIN_STEP here and instead use the HomeKit
+                # default of 0.1 in order to have enough precision to convert
+                # temperature units and avoid setting to 73F will result in 74F
+                properties={PROP_MIN_VALUE: hc_min_temp, PROP_MAX_VALUE: hc_max_temp},
+            )
+        self.char_target_humidity = None
+        if CHAR_TARGET_HUMIDITY in self.chars:
+            self.char_target_humidity = serv_thermostat.configure_char(
+                CHAR_TARGET_HUMIDITY,
+                value=50,
+                # We do not set a max humidity because
+                # homekit currently has a bug that will show the lower bound
+                # shifted upwards.  For example if you have a max humidity
+                # of 80% homekit will give you the options 20%-100% instead
+                # of 0-80%
+                properties={PROP_MIN_VALUE: min_humidity},
+            )
+        self.char_current_humidity = None
+        if CHAR_CURRENT_HUMIDITY in self.chars:
+            self.char_current_humidity = serv_thermostat.configure_char(
+                CHAR_CURRENT_HUMIDITY, value=50
             )
 
-    def get_temperature_range(self):
-        """Return min and max temperature range."""
-        max_temp = self.hass.states.get(self.entity_id).attributes.get(ATTR_MAX_TEMP)
-        max_temp = (
-            temperature_to_homekit(max_temp, self._unit)
-            if max_temp
-            else DEFAULT_MAX_TEMP
-        )
-        max_temp = round(max_temp * 2) / 2
+        # Fan/swing modes are detected in the base class.
+        if self.ordered_fan_speeds:
+            self.fan_chars.append(CHAR_ROTATION_SPEED)
 
-        min_temp = self.hass.states.get(self.entity_id).attributes.get(ATTR_MIN_TEMP)
-        min_temp = (
-            temperature_to_homekit(min_temp, self._unit)
-            if min_temp
-            else DEFAULT_MIN_TEMP
-        )
-        min_temp = round(min_temp * 2) / 2
+        if FAN_AUTO in self.fan_modes and (
+            FAN_ON in self.fan_modes or self.ordered_fan_speeds
+        ):
+            self.fan_chars.append(CHAR_TARGET_FAN_STATE)
 
-        return min_temp, max_temp
+        if self.swing_on_mode:
+            self.fan_chars.append(CHAR_SWING_MODE)
 
-    def set_heat_cool(self, value):
-        """Change operation mode to value if call came from HomeKit."""
-        _LOGGER.debug("%s: Set heat-cool to %d", self.entity_id, value)
-        self._flag_heat_cool = True
-        hass_value = self.hc_homekit_to_hass[value]
-        params = {ATTR_ENTITY_ID: self.entity_id, ATTR_HVAC_MODE: hass_value}
-        self.call_service(
-            DOMAIN_CLIMATE, SERVICE_SET_HVAC_MODE_THERMOSTAT, params, hass_value
-        )
+        if self.fan_chars:
+            if attributes.get(ClimateEntityStateAttribute.HVAC_ACTION) is not None:
+                self.fan_chars.append(CHAR_CURRENT_FAN_STATE)
+            self._configure_fan_service(serv_thermostat)
 
-    @debounce
-    def set_cooling_threshold(self, value):
-        """Set cooling threshold temp to value if call came from HomeKit."""
-        _LOGGER.debug(
-            "%s: Set cooling threshold temperature to %.1f°C", self.entity_id, value
+        # Every service exists now, so they all get an explicit primary
+        # flag; without one the Home app can pick its own tile service.
+        self.set_primary_service(serv_thermostat)
+
+        self.async_update_state(state)
+
+        serv_thermostat.setter_callback = self._set_chars
+
+    def _set_chars(self, char_values: dict[str, Any]) -> None:
+        _LOGGER.debug("Thermostat _set_chars: %s", char_values)
+        events = []
+        params: dict[str, Any] = {ATTR_ENTITY_ID: self.entity_id}
+        service = None
+        state = self.hass.states.get(self.entity_id)
+        assert state
+        features = state.attributes.get(EntityStateAttribute.SUPPORTED_FEATURES, 0)
+        homekit_hvac_mode = _hk_hvac_mode_from_state(state)
+        # Homekit will reset the mode when VIEWING the temp
+        # Ignore it if its the same mode
+        if (
+            CHAR_TARGET_HEATING_COOLING in char_values
+            and char_values[CHAR_TARGET_HEATING_COOLING] != homekit_hvac_mode
+        ):
+            target_hc = char_values[CHAR_TARGET_HEATING_COOLING]
+            if target_hc not in self.hc_homekit_to_hass:
+                # If the target heating cooling state we want does not
+                # exist on the device, we have to sort it out
+                # based on the current and target temperature since
+                # siri will always send HC_HEAT_COOL_AUTO in this case
+                # and hope for the best.
+                hc_target_temp = char_values.get(CHAR_TARGET_TEMPERATURE)
+                hc_current_temp = temperature_attribute_to_homekit(
+                    state,
+                    ClimateEntityStateAttribute.CURRENT_TEMPERATURE,
+                    self._unit,
+                )
+                hc_fallback_order = HC_HEAT_COOL_PREFER_HEAT
+                if (
+                    hc_target_temp is not None
+                    and hc_current_temp is not None
+                    and hc_target_temp < hc_current_temp
+                ):
+                    hc_fallback_order = HC_HEAT_COOL_PREFER_COOL
+                for hc_fallback in hc_fallback_order:
+                    if hc_fallback in self.hc_homekit_to_hass:
+                        _LOGGER.debug(
+                            (
+                                "Siri requested target mode: %s and the device does not"
+                                " support, falling back to %s"
+                            ),
+                            target_hc,
+                            hc_fallback,
+                        )
+                        self.char_target_heat_cool.value = target_hc = hc_fallback
+                        break
+
+            params[ClimateServiceArgument.HVAC_MODE] = self.hc_homekit_to_hass[
+                target_hc
+            ]
+            events.append(
+                f"{CHAR_TARGET_HEATING_COOLING} to"
+                f" {char_values[CHAR_TARGET_HEATING_COOLING]}"
+            )
+            # Many integrations do not actually implement `hvac_mode` for the
+            # `climate.set_temperature` action so we
+            # made a call to `climate.set_hvac_mode`
+            # before calling `climate.set_temperature`
+            # to ensure the device is in the right mode before setting the temp.
+            self.async_call_service(
+                CLIMATE_DOMAIN,
+                ClimateService.SET_HVAC_MODE,
+                params.copy(),
+                ", ".join(events),
+            )
+
+        if CHAR_TARGET_TEMPERATURE in char_values:
+            hc_target_temp = char_values[CHAR_TARGET_TEMPERATURE]
+            if features & ClimateEntityFeature.TARGET_TEMPERATURE:
+                service = ClimateService.SET_TEMPERATURE
+                temperature = self._temperature_to_states(hc_target_temp)
+                events.append(
+                    f"{CHAR_TARGET_TEMPERATURE} to"
+                    f" {char_values[CHAR_TARGET_TEMPERATURE]}°C"
+                )
+                params[ClimateServiceArgument.TEMPERATURE] = temperature
+            elif features & ClimateEntityFeature.TARGET_TEMPERATURE_RANGE:
+                # Homekit will send us a target temperature
+                # even if the device does not support it
+                _LOGGER.debug(
+                    "Homekit requested target temp: %s and the device does not support",
+                    hc_target_temp,
+                )
+                if (
+                    homekit_hvac_mode == HC_HEAT_COOL_HEAT
+                    and CHAR_HEATING_THRESHOLD_TEMPERATURE not in char_values
+                ):
+                    char_values[CHAR_HEATING_THRESHOLD_TEMPERATURE] = hc_target_temp
+                if (
+                    homekit_hvac_mode == HC_HEAT_COOL_COOL
+                    and CHAR_COOLING_THRESHOLD_TEMPERATURE not in char_values
+                ):
+                    char_values[CHAR_COOLING_THRESHOLD_TEMPERATURE] = hc_target_temp
+
+        if (
+            CHAR_HEATING_THRESHOLD_TEMPERATURE in char_values
+            or CHAR_COOLING_THRESHOLD_TEMPERATURE in char_values
+        ):
+            assert self.char_cooling_thresh_temp
+            assert self.char_heating_thresh_temp
+            service = ClimateService.SET_TEMPERATURE
+            new_high = char_values.get(CHAR_COOLING_THRESHOLD_TEMPERATURE)
+            new_low = char_values.get(CHAR_HEATING_THRESHOLD_TEMPERATURE)
+            if new_high is not None:
+                events.append(f"{CHAR_COOLING_THRESHOLD_TEMPERATURE} to {new_high}°C")
+            if new_low is not None:
+                events.append(f"{CHAR_HEATING_THRESHOLD_TEMPERATURE} to {new_low}°C")
+            # A device without TARGET_TEMPERATURE can send an inverted pair.
+            params.update(
+                self._dual_setpoint_params(
+                    self.char_cooling_thresh_temp,
+                    self.char_heating_thresh_temp,
+                    new_high,
+                    new_low,
+                )
+            )
+
+        if service:
+            self.async_call_service(
+                CLIMATE_DOMAIN,
+                service,
+                params,
+                ", ".join(events),
+            )
+
+        if CHAR_TARGET_HUMIDITY in char_values:
+            self.set_target_humidity(char_values[CHAR_TARGET_HUMIDITY])
+
+    def _configure_hvac_modes(self, state: State) -> None:
+        """Configure target mode characteristics."""
+        # This cannot be none OR an empty list
+        hc_modes = (
+            state.attributes.get(ClimateEntityCapabilityAttribute.HVAC_MODES)
+            or DEFAULT_HVAC_MODES
         )
-        self._flag_coolingthresh = True
-        low = self.char_heating_thresh_temp.value
-        temperature = temperature_to_states(value, self._unit)
+        # Determine available modes for this entity,
+        # Prefer HEAT_COOL over AUTO and COOL over FAN_ONLY, DRY
+        #
+        # HEAT_COOL is preferred over auto because HomeKit Accessory Protocol describes
+        # heating or cooling comes on to maintain a target temp which is closest to
+        # the Home Assistant spec
+        #
+        # HVACMode.HEAT_COOL: The device supports heating/cooling to a range
+        self.hc_homekit_to_hass = {
+            c: s
+            for s, c in HC_HASS_TO_HOMEKIT.items()
+            if (
+                s in hc_modes
+                and not (
+                    (s == HVACMode.AUTO and HVACMode.HEAT_COOL in hc_modes)
+                    or (
+                        s in (HVACMode.DRY, HVACMode.FAN_ONLY)
+                        and HVACMode.COOL in hc_modes
+                    )
+                )
+            )
+        }
+        self.hc_hass_to_homekit = {k: v for v, k in self.hc_homekit_to_hass.items()}
+
+    def set_target_humidity(self, value: float) -> None:
+        """Set target humidity to value if call came from HomeKit."""
+        _LOGGER.debug("%s: Set target humidity to %d", self.entity_id, value)
         params = {
             ATTR_ENTITY_ID: self.entity_id,
-            ATTR_TARGET_TEMP_HIGH: temperature,
-            ATTR_TARGET_TEMP_LOW: temperature_to_states(low, self._unit),
+            ClimateServiceArgument.HUMIDITY: value,
         }
-        self.call_service(
-            DOMAIN_CLIMATE,
-            SERVICE_SET_TEMPERATURE_THERMOSTAT,
-            params,
-            f"cooling threshold {temperature}{self._unit}",
+        self.async_call_service(
+            CLIMATE_DOMAIN, ClimateService.SET_HUMIDITY, params, f"{value}{PERCENTAGE}"
         )
 
-    @debounce
-    def set_heating_threshold(self, value):
-        """Set heating threshold temp to value if call came from HomeKit."""
-        _LOGGER.debug(
-            "%s: Set heating threshold temperature to %.1f°C", self.entity_id, value
-        )
-        self._flag_heatingthresh = True
-        high = self.char_cooling_thresh_temp.value
-        temperature = temperature_to_states(value, self._unit)
-        params = {
-            ATTR_ENTITY_ID: self.entity_id,
-            ATTR_TARGET_TEMP_HIGH: temperature_to_states(high, self._unit),
-            ATTR_TARGET_TEMP_LOW: temperature,
-        }
-        self.call_service(
-            DOMAIN_CLIMATE,
-            SERVICE_SET_TEMPERATURE_THERMOSTAT,
-            params,
-            f"heating threshold {temperature}{self._unit}",
-        )
+    @callback
+    @override
+    def async_update_state(self, new_state: State) -> None:
+        """Update state without rechecking the device features."""
+        attributes = new_state.attributes
+        features = attributes.get(EntityStateAttribute.SUPPORTED_FEATURES, 0)
 
-    @debounce
-    def set_target_temperature(self, value):
-        """Set target temperature to value if call came from HomeKit."""
-        _LOGGER.debug("%s: Set target temperature to %.1f°C", self.entity_id, value)
-        self._flag_temperature = True
-        temperature = temperature_to_states(value, self._unit)
-        params = {ATTR_ENTITY_ID: self.entity_id, ATTR_TEMPERATURE: temperature}
-        self.call_service(
-            DOMAIN_CLIMATE,
-            SERVICE_SET_TEMPERATURE_THERMOSTAT,
-            params,
-            f"{temperature}{self._unit}",
-        )
+        # Update target operation mode FIRST
+        if (homekit_hvac_mode := _hk_hvac_mode_from_state(new_state)) is not None:
+            if homekit_hvac_mode in self.hc_homekit_to_hass:
+                self.char_target_heat_cool.set_value(homekit_hvac_mode)
+            else:
+                _LOGGER.error(
+                    (
+                        "Cannot map hvac target mode: %s to homekit as only %s modes"
+                        " are supported"
+                    ),
+                    new_state.state,
+                    self.hc_homekit_to_hass,
+                )
 
-    def update_state(self, new_state):
-        """Update thermostat state after state changed."""
-        # Update current temperature
-        current_temp = new_state.attributes.get(ATTR_CURRENT_TEMPERATURE)
-        if isinstance(current_temp, (int, float)):
-            current_temp = temperature_to_homekit(current_temp, self._unit)
-            self.char_current_temp.set_value(current_temp)
+        # Set current operation mode for supported thermostats
+        if hvac_action := attributes.get(ClimateEntityStateAttribute.HVAC_ACTION):
+            self.char_current_heat_cool.set_value(
+                HC_HASS_TO_HOMEKIT_ACTION.get(hvac_action, HC_HEAT_COOL_OFF)
+            )
+
+        self._update_current_temperature_char(new_state)
+
+        # Update current humidity
+        if CHAR_CURRENT_HUMIDITY in self.chars:
+            assert self.char_current_humidity
+            current_humdity = attributes.get(
+                ClimateEntityStateAttribute.CURRENT_HUMIDITY
+            )
+            if isinstance(current_humdity, (int, float)):
+                self.char_current_humidity.set_value(current_humdity)
+
+        # Update target humidity
+        if CHAR_TARGET_HUMIDITY in self.chars:
+            assert self.char_target_humidity
+            target_humdity = attributes.get(ClimateEntityStateAttribute.TARGET_HUMIDITY)
+            if isinstance(target_humdity, (int, float)):
+                self.char_target_humidity.set_value(target_humdity)
+
+        # Update threshold temperatures if the characteristics exist
+        if self.char_cooling_thresh_temp:
+            self._update_temperature_char(
+                self.char_cooling_thresh_temp,
+                new_state,
+                ClimateEntityStateAttribute.TARGET_TEMP_HIGH,
+            )
+        if self.char_heating_thresh_temp:
+            self._update_temperature_char(
+                self.char_heating_thresh_temp,
+                new_state,
+                ClimateEntityStateAttribute.TARGET_TEMP_LOW,
+            )
 
         # Update target temperature
-        target_temp = new_state.attributes.get(ATTR_TEMPERATURE)
-        if isinstance(target_temp, (int, float)):
-            target_temp = temperature_to_homekit(target_temp, self._unit)
-            if not self._flag_temperature:
-                self.char_target_temp.set_value(target_temp)
-        self._flag_temperature = False
-
-        # Update cooling threshold temperature if characteristic exists
-        if self.char_cooling_thresh_temp:
-            cooling_thresh = new_state.attributes.get(ATTR_TARGET_TEMP_HIGH)
-            if isinstance(cooling_thresh, (int, float)):
-                cooling_thresh = temperature_to_homekit(cooling_thresh, self._unit)
-                if not self._flag_coolingthresh:
-                    self.char_cooling_thresh_temp.set_value(cooling_thresh)
-        self._flag_coolingthresh = False
-
-        # Update heating threshold temperature if characteristic exists
-        if self.char_heating_thresh_temp:
-            heating_thresh = new_state.attributes.get(ATTR_TARGET_TEMP_LOW)
-            if isinstance(heating_thresh, (int, float)):
-                heating_thresh = temperature_to_homekit(heating_thresh, self._unit)
-                if not self._flag_heatingthresh:
-                    self.char_heating_thresh_temp.set_value(heating_thresh)
-        self._flag_heatingthresh = False
+        target_temp = temperature_attribute_to_homekit(
+            new_state, ClimateEntityStateAttribute.TARGET_TEMPERATURE, self._unit
+        )
+        if (
+            target_temp is None
+            and features & ClimateEntityFeature.TARGET_TEMPERATURE_RANGE
+        ):
+            # Homekit expects a target temperature
+            # even if the device does not support it
+            hc_hvac_mode = self.char_target_heat_cool.value
+            if hc_hvac_mode == HC_HEAT_COOL_HEAT:
+                temp_low = attributes.get(ClimateEntityStateAttribute.TARGET_TEMP_LOW)
+                if isinstance(temp_low, (int, float)):
+                    target_temp = self._temperature_to_homekit(temp_low)
+            elif hc_hvac_mode == HC_HEAT_COOL_COOL:
+                temp_high = attributes.get(ClimateEntityStateAttribute.TARGET_TEMP_HIGH)
+                if isinstance(temp_high, (int, float)):
+                    target_temp = self._temperature_to_homekit(temp_high)
+        if target_temp:
+            self.char_target_temp.set_value(target_temp)
 
         # Update display units
         if self._unit and self._unit in UNIT_HASS_TO_HOMEKIT:
-            self.char_display_units.set_value(UNIT_HASS_TO_HOMEKIT[self._unit])
+            unit = UNIT_HASS_TO_HOMEKIT[self._unit]
+            self.char_display_units.set_value(unit)
 
-        # Update target operation mode
-        hvac_mode = new_state.state
-        if hvac_mode and hvac_mode in HC_HASS_TO_HOMEKIT:
-            if not self._flag_heat_cool:
-                self.char_target_heat_cool.set_value(HC_HASS_TO_HOMEKIT[hvac_mode])
-        self._flag_heat_cool = False
-
-        # Set current operation mode for supported thermostats
-        hvac_action = new_state.attributes.get(ATTR_HVAC_ACTION)
-        if hvac_action:
-            self.char_current_heat_cool.set_value(
-                HC_HASS_TO_HOMEKIT_ACTION[hvac_action]
-            )
+        if self.fan_chars:
+            self._async_update_fan_service(new_state)
 
 
 @TYPES.register("WaterHeater")
 class WaterHeater(HomeAccessory):
     """Generate a WaterHeater accessory for a water_heater."""
 
-    def __init__(self, *args):
+    def __init__(self, *args: Any) -> None:
         """Initialize a WaterHeater accessory object."""
         super().__init__(*args, category=CATEGORY_THERMOSTAT)
+        self._reload_on_change_attrs.extend(
+            (
+                WaterHeaterCapabilityAttribute.MAX_TEMP,
+                WaterHeaterCapabilityAttribute.MIN_TEMP,
+                WaterHeaterCapabilityAttribute.OPERATION_LIST,
+            )
+        )
         self._unit = self.hass.config.units.temperature_unit
-        self._flag_heat_cool = False
-        self._flag_temperature = False
-        min_temp, max_temp = self.get_temperature_range()
+        state = self.hass.states.get(self.entity_id)
+        assert state
+        min_temp, max_temp = self.get_temperature_range(state)
+
+        features = state.attributes.get(EntityStateAttribute.SUPPORTED_FEATURES, 0)
+        operation_list = (
+            state.attributes.get(WaterHeaterCapabilityAttribute.OPERATION_LIST) or []
+        )
+        self._supports_on_off = bool(features & WaterHeaterEntityFeature.ON_OFF)
+        self._supports_operation_mode = bool(
+            features & WaterHeaterEntityFeature.OPERATION_MODE
+        )
+        self._off_mode_available = self._supports_on_off or (
+            self._supports_operation_mode and STATE_OFF in operation_list
+        )
+
+        valid_modes = dict(HC_HOMEKIT_VALID_MODES_WATER_HEATER)
+        if self._off_mode_available:
+            valid_modes["Off"] = HC_HEAT_COOL_OFF
 
         serv_thermostat = self.add_preload_service(SERV_THERMOSTAT)
 
@@ -361,7 +580,7 @@ class WaterHeater(HomeAccessory):
             CHAR_TARGET_HEATING_COOLING,
             value=1,
             setter_callback=self.set_heat_cool,
-            valid_values=HC_HOMEKIT_VALID_MODES_WATER_HEATER,
+            valid_values=valid_modes,
         )
 
         self.char_current_temp = serv_thermostat.configure_char(
@@ -370,11 +589,10 @@ class WaterHeater(HomeAccessory):
         self.char_target_temp = serv_thermostat.configure_char(
             CHAR_TARGET_TEMPERATURE,
             value=50.0,
-            properties={
-                PROP_MIN_VALUE: min_temp,
-                PROP_MAX_VALUE: max_temp,
-                PROP_MIN_STEP: 0.5,
-            },
+            # We do not set PROP_MIN_STEP here and instead use the HomeKit
+            # default of 0.1 in order to have enough precision to convert
+            # temperature units and avoid setting to 73F will result in 74F
+            properties={PROP_MIN_VALUE: min_temp, PROP_MAX_VALUE: max_temp},
             setter_callback=self.set_target_temperature,
         )
 
@@ -382,65 +600,110 @@ class WaterHeater(HomeAccessory):
             CHAR_TEMP_DISPLAY_UNITS, value=0
         )
 
-    def get_temperature_range(self):
+        self.async_update_state(state)
+
+    def get_temperature_range(self, state: State) -> tuple[float, float]:
         """Return min and max temperature range."""
-        max_temp = self.hass.states.get(self.entity_id).attributes.get(ATTR_MAX_TEMP)
-        max_temp = (
-            temperature_to_homekit(max_temp, self._unit)
-            if max_temp
-            else DEFAULT_MAX_TEMP_WATER_HEATER
+        return get_temperature_range_from_state(
+            state,
+            self._unit,
+            DEFAULT_MIN_TEMP_WATER_HEATER,
+            DEFAULT_MAX_TEMP_WATER_HEATER,
         )
-        max_temp = round(max_temp * 2) / 2
 
-        min_temp = self.hass.states.get(self.entity_id).attributes.get(ATTR_MIN_TEMP)
-        min_temp = (
-            temperature_to_homekit(min_temp, self._unit)
-            if min_temp
-            else DEFAULT_MIN_TEMP_WATER_HEATER
-        )
-        min_temp = round(min_temp * 2) / 2
-
-        return min_temp, max_temp
-
-    def set_heat_cool(self, value):
+    def set_heat_cool(self, value: int) -> None:
         """Change operation mode to value if call came from HomeKit."""
         _LOGGER.debug("%s: Set heat-cool to %d", self.entity_id, value)
-        self._flag_heat_cool = True
-        hass_value = HC_HOMEKIT_TO_HASS[value]
-        if hass_value != HVAC_MODE_HEAT:
-            self.char_target_heat_cool.set_value(1)  # Heat
+        params: dict[str, Any] = {ATTR_ENTITY_ID: self.entity_id}
+        if value == HC_HEAT_COOL_OFF:
+            if self._supports_on_off:
+                self.async_call_service(
+                    WATER_HEATER_DOMAIN, WaterHeaterService.TURN_OFF, params, "off"
+                )
+            elif self._off_mode_available and self._supports_operation_mode:
+                params[WaterHeaterServiceArgument.OPERATION_MODE] = STATE_OFF
+                self.async_call_service(
+                    WATER_HEATER_DOMAIN,
+                    WaterHeaterService.SET_OPERATION_MODE,
+                    params,
+                    STATE_OFF,
+                )
+            else:
+                self.char_target_heat_cool.set_value(HC_HEAT_COOL_HEAT)
+        elif value == HC_HEAT_COOL_HEAT:
+            if self._supports_on_off:
+                self.async_call_service(
+                    WATER_HEATER_DOMAIN, WaterHeaterService.TURN_ON, params, "on"
+                )
+            elif self._off_mode_available and self._supports_operation_mode:
+                state = self.hass.states.get(self.entity_id)
+                if not state:
+                    return
+                current_operation_mode = state.attributes.get(
+                    WaterHeaterStateAttribute.OPERATION_MODE
+                )
+                if current_operation_mode and current_operation_mode != STATE_OFF:
+                    # Already in a non-off operation mode; do not change it.
+                    return
+                operation_list = (
+                    state.attributes.get(WaterHeaterCapabilityAttribute.OPERATION_LIST)
+                    or []
+                )
+                for mode in operation_list:
+                    if mode != STATE_OFF:
+                        params[WaterHeaterServiceArgument.OPERATION_MODE] = mode
+                        self.async_call_service(
+                            WATER_HEATER_DOMAIN,
+                            WaterHeaterService.SET_OPERATION_MODE,
+                            params,
+                            mode,
+                        )
+                        break
+        else:
+            self.char_target_heat_cool.set_value(HC_HEAT_COOL_HEAT)
 
-    @debounce
-    def set_target_temperature(self, value):
+    def set_target_temperature(self, value: float) -> None:
         """Set target temperature to value if call came from HomeKit."""
         _LOGGER.debug("%s: Set target temperature to %.1f°C", self.entity_id, value)
-        self._flag_temperature = True
         temperature = temperature_to_states(value, self._unit)
-        params = {ATTR_ENTITY_ID: self.entity_id, ATTR_TEMPERATURE: temperature}
-        self.call_service(
-            DOMAIN_WATER_HEATER,
-            SERVICE_SET_TEMPERATURE_WATER_HEATER,
+        params = {
+            ATTR_ENTITY_ID: self.entity_id,
+            WaterHeaterServiceArgument.TEMPERATURE: temperature,
+        }
+        self.async_call_service(
+            WATER_HEATER_DOMAIN,
+            WaterHeaterService.SET_TEMPERATURE,
             params,
             f"{temperature}{self._unit}",
         )
 
-    def update_state(self, new_state):
+    @callback
+    @override
+    def async_update_state(self, new_state: State) -> None:
         """Update water_heater state after state change."""
         # Update current and target temperature
-        temperature = new_state.attributes.get(ATTR_TEMPERATURE)
-        if isinstance(temperature, (int, float)):
-            temperature = temperature_to_homekit(temperature, self._unit)
-            self.char_current_temp.set_value(temperature)
-            if not self._flag_temperature:
-                self.char_target_temp.set_value(temperature)
-        self._flag_temperature = False
+        target_temperature = temperature_attribute_to_homekit(
+            new_state, WaterHeaterStateAttribute.TARGET_TEMPERATURE, self._unit
+        )
+        if target_temperature is not None:
+            self.char_target_temp.set_value(target_temperature)
+
+        current_temperature = temperature_attribute_to_homekit(
+            new_state, WaterHeaterStateAttribute.CURRENT_TEMPERATURE, self._unit
+        )
+        if current_temperature is not None:
+            self.char_current_temp.set_value(current_temperature)
 
         # Update display units
         if self._unit and self._unit in UNIT_HASS_TO_HOMEKIT:
-            self.char_display_units.set_value(UNIT_HASS_TO_HOMEKIT[self._unit])
+            unit = UNIT_HASS_TO_HOMEKIT[self._unit]
+            self.char_display_units.set_value(unit)
 
         # Update target operation mode
-        operation_mode = new_state.state
-        if operation_mode and not self._flag_heat_cool:
-            self.char_target_heat_cool.set_value(1)  # Heat
-        self._flag_heat_cool = False
+        if new_state.state:
+            if new_state.state == STATE_OFF and self._off_mode_available:
+                self.char_target_heat_cool.set_value(HC_HEAT_COOL_OFF)
+                self.char_current_heat_cool.set_value(HC_HEAT_COOL_OFF)
+            else:
+                self.char_target_heat_cool.set_value(HC_HEAT_COOL_HEAT)
+                self.char_current_heat_cool.set_value(HC_HEAT_COOL_HEAT)

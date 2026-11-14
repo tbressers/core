@@ -1,64 +1,57 @@
-"""Component for the Somfy MyLink device supporting the Synergy API."""
-import logging
+"""The Somfy MyLink integration."""
 
-from somfy_mylink_synergy import SomfyMyLinkSynergy
-import voluptuous as vol
+from dataclasses import dataclass
 
-from homeassistant.const import CONF_HOST, CONF_PORT
-from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.discovery import async_load_platform
-
-_LOGGER = logging.getLogger(__name__)
-CONF_ENTITY_CONFIG = "entity_config"
-CONF_SYSTEM_ID = "system_id"
-CONF_REVERSE = "reverse"
-CONF_DEFAULT_REVERSE = "default_reverse"
-DATA_SOMFY_MYLINK = "somfy_mylink_data"
-DOMAIN = "somfy_mylink"
-SOMFY_MYLINK_COMPONENTS = ["cover"]
-
-
-def validate_entity_config(values):
-    """Validate config entry for CONF_ENTITY."""
-    entity_config_schema = vol.Schema({vol.Optional(CONF_REVERSE): cv.boolean})
-    if not isinstance(values, dict):
-        raise vol.Invalid("expected a dictionary")
-    entities = {}
-    for entity_id, config in values.items():
-        entity = cv.entity_id(entity_id)
-        config = entity_config_schema(config)
-        entities[entity] = config
-    return entities
-
-
-CONFIG_SCHEMA = vol.Schema(
-    {
-        DOMAIN: vol.Schema(
-            {
-                vol.Required(CONF_SYSTEM_ID): cv.string,
-                vol.Required(CONF_HOST): cv.string,
-                vol.Optional(CONF_PORT, default=44100): cv.port,
-                vol.Optional(CONF_DEFAULT_REVERSE, default=False): cv.boolean,
-                vol.Optional(CONF_ENTITY_CONFIG, default={}): validate_entity_config,
-            }
-        )
-    },
-    extra=vol.ALLOW_EXTRA,
+from pysomfymylink import (
+    Shade,
+    SomfyMyLink,
+    SomfyMyLinkApiError,
+    SomfyMyLinkConnectionError,
 )
 
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_HOST, CONF_PORT
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryNotReady
 
-async def async_setup(hass, config):
-    """Set up the MyLink platform."""
+from .const import CONF_SYSTEM_ID, PLATFORMS
 
-    host = config[DOMAIN][CONF_HOST]
-    port = config[DOMAIN][CONF_PORT]
-    system_id = config[DOMAIN][CONF_SYSTEM_ID]
-    entity_config = config[DOMAIN][CONF_ENTITY_CONFIG]
-    entity_config[CONF_DEFAULT_REVERSE] = config[DOMAIN][CONF_DEFAULT_REVERSE]
-    somfy_mylink = SomfyMyLinkSynergy(system_id, host, port)
-    hass.data[DATA_SOMFY_MYLINK] = somfy_mylink
-    for component in SOMFY_MYLINK_COMPONENTS:
-        hass.async_create_task(
-            async_load_platform(hass, component, DOMAIN, entity_config, config)
-        )
-    return True
+type SomfyMyLinkConfigEntry = ConfigEntry[SomfyMyLinkRuntimeData]
+
+
+@dataclass
+class SomfyMyLinkRuntimeData:
+    """Runtime data for Somfy MyLink."""
+
+    somfy_mylink: SomfyMyLink
+    shades: list[Shade]
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: SomfyMyLinkConfigEntry) -> None:
+    """Set up Somfy MyLink from a config entry."""
+    somfy_mylink = SomfyMyLink(
+        entry.data[CONF_HOST],
+        entry.data[CONF_SYSTEM_ID],
+        port=entry.data[CONF_PORT],
+    )
+
+    try:
+        shades = await somfy_mylink.status_info()
+    except (SomfyMyLinkConnectionError, SomfyMyLinkApiError) as ex:
+        raise ConfigEntryNotReady(
+            "Unable to reach the Somfy MyLink device, please check your settings"
+        ) from ex
+
+    entry.runtime_data = SomfyMyLinkRuntimeData(
+        somfy_mylink=somfy_mylink,
+        shades=shades,
+    )
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+
+async def async_unload_entry(
+    hass: HomeAssistant, entry: SomfyMyLinkConfigEntry
+) -> None:
+    """Unload a config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)

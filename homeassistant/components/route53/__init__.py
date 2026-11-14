@@ -1,122 +1,62 @@
 """Update the IP addresses of your Route53 DNS records."""
-from datetime import timedelta
-import logging
-from typing import List
 
-import boto3
-from ipify import exceptions, get_ip
-import voluptuous as vol
+from datetime import timedelta
+
+import probatio
 
 from homeassistant.const import CONF_DOMAIN, CONF_TTL, CONF_ZONE
-import homeassistant.helpers.config_validation as cv
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.event import track_time_interval
+from homeassistant.helpers.typing import ConfigType
 
-_LOGGER = logging.getLogger(__name__)
+from .const import DATA_ROUTE53, DOMAIN
+from .helpers import Route53Data, update_route53
+from .services import setup_services
 
 CONF_ACCESS_KEY_ID = "aws_access_key_id"
 CONF_SECRET_ACCESS_KEY = "aws_secret_access_key"
 CONF_RECORDS = "records"
 
-DOMAIN = "route53"
-
 INTERVAL = timedelta(minutes=60)
 DEFAULT_TTL = 300
 
-CONFIG_SCHEMA = vol.Schema(
+CONFIG_SCHEMA = probatio.Schema(
     {
-        DOMAIN: vol.Schema(
+        DOMAIN: probatio.Schema(
             {
-                vol.Required(CONF_ACCESS_KEY_ID): cv.string,
-                vol.Required(CONF_DOMAIN): cv.string,
-                vol.Required(CONF_RECORDS): vol.All(cv.ensure_list, [cv.string]),
-                vol.Required(CONF_SECRET_ACCESS_KEY): cv.string,
-                vol.Required(CONF_ZONE): cv.string,
-                vol.Optional(CONF_TTL, default=DEFAULT_TTL): cv.positive_int,
+                probatio.Required(CONF_ACCESS_KEY_ID): cv.string,
+                probatio.Required(CONF_DOMAIN): cv.string,
+                probatio.Required(CONF_RECORDS): probatio.All(
+                    probatio.EnsureList(), [cv.string]
+                ),
+                probatio.Required(probatio.Secret(CONF_SECRET_ACCESS_KEY)): cv.string,
+                probatio.Required(CONF_ZONE): cv.string,
+                probatio.Optional(CONF_TTL, default=DEFAULT_TTL): cv.positive_int,
             }
         )
     },
-    extra=vol.ALLOW_EXTRA,
+    extra=probatio.ALLOW_EXTRA,
 )
 
 
-def setup(hass, config):
+def setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the Route53 component."""
-    domain = config[DOMAIN][CONF_DOMAIN]
-    records = config[DOMAIN][CONF_RECORDS]
-    zone = config[DOMAIN][CONF_ZONE]
-    aws_access_key_id = config[DOMAIN][CONF_ACCESS_KEY_ID]
-    aws_secret_access_key = config[DOMAIN][CONF_SECRET_ACCESS_KEY]
-    ttl = config[DOMAIN][CONF_TTL]
+    domain_config = config[DOMAIN]
+    data = hass.data[DATA_ROUTE53] = Route53Data(
+        aws_access_key_id=domain_config[CONF_ACCESS_KEY_ID],
+        aws_secret_access_key=domain_config[CONF_SECRET_ACCESS_KEY],
+        zone=domain_config[CONF_ZONE],
+        domain=domain_config[CONF_DOMAIN],
+        records=domain_config[CONF_RECORDS],
+        ttl=domain_config[CONF_TTL],
+    )
 
     def update_records_interval(now):
         """Set up recurring update."""
-        _update_route53(
-            aws_access_key_id, aws_secret_access_key, zone, domain, records, ttl
-        )
-
-    def update_records_service(now):
-        """Set up service for manual trigger."""
-        _update_route53(
-            aws_access_key_id, aws_secret_access_key, zone, domain, records, ttl
-        )
+        update_route53(data)
 
     track_time_interval(hass, update_records_interval, INTERVAL)
 
-    hass.services.register(DOMAIN, "update_records", update_records_service)
+    setup_services(hass)
     return True
-
-
-def _update_route53(
-    aws_access_key_id: str,
-    aws_secret_access_key: str,
-    zone: str,
-    domain: str,
-    records: List[str],
-    ttl: int,
-):
-    _LOGGER.debug("Starting update for zone %s", zone)
-
-    client = boto3.client(
-        DOMAIN,
-        aws_access_key_id=aws_access_key_id,
-        aws_secret_access_key=aws_secret_access_key,
-    )
-
-    # Get the IP Address and build an array of changes
-    try:
-        ipaddress = get_ip()
-
-    except exceptions.ConnectionError:
-        _LOGGER.warning("Unable to reach the ipify service")
-        return
-
-    except exceptions.ServiceError:
-        _LOGGER.warning("Unable to complete the ipfy request")
-        return
-
-    changes = []
-    for record in records:
-        _LOGGER.debug("Processing record: %s", record)
-
-        changes.append(
-            {
-                "Action": "UPSERT",
-                "ResourceRecordSet": {
-                    "Name": f"{record}.{domain}",
-                    "Type": "A",
-                    "TTL": ttl,
-                    "ResourceRecords": [{"Value": ipaddress}],
-                },
-            }
-        )
-
-    _LOGGER.debug("Submitting the following changes to Route53")
-    _LOGGER.debug(changes)
-
-    response = client.change_resource_record_sets(
-        HostedZoneId=zone, ChangeBatch={"Changes": changes}
-    )
-    _LOGGER.debug("Response is %s", response)
-
-    if response["ResponseMetadata"]["HTTPStatusCode"] != 200:
-        _LOGGER.warning(response)

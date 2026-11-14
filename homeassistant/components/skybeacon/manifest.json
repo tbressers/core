@@ -1,8 +1,12 @@
 {
   "domain": "skybeacon",
   "name": "Skybeacon",
+  "categories": ["sensors.temperature_humidity"],
+  "codeowners": [],
+  "connectivity": ["bluetooth"],
   "documentation": "https://www.home-assistant.io/integrations/skybeacon",
-  "requirements": ["pygatt[GATTTOOL]==4.0.5"],
-  "dependencies": [],
-  "codeowners": []
+  "iot_class": "local_polling",
+  "loggers": ["pygatt"],
+  "quality_scale": "legacy",
+  "requirements": ["pygatt[GATTTOOL]==4.0.5"]
 }

@@ -1,55 +1,68 @@
 """Support for Genius Hub switch/outlet devices."""
-from homeassistant.components.switch import DEVICE_CLASS_OUTLET, SwitchDevice
-from homeassistant.helpers.typing import ConfigType, HomeAssistantType
 
-from . import DOMAIN, GeniusZone
+from datetime import timedelta
+from typing import Any, override
 
-ATTR_DURATION = "duration"
+from homeassistant.components.switch import SwitchDeviceClass, SwitchEntity
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+
+from . import GeniusHubConfigEntry
+from .const import GeniusHubServiceArgument
+from .entity import GeniusZone
 
 GH_ON_OFF_ZONE = "on / off"
 
 
-async def async_setup_platform(
-    hass: HomeAssistantType, config: ConfigType, async_add_entities, discovery_info=None
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: GeniusHubConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the Genius Hub switch entities."""
-    if discovery_info is None:
-        return
 
-    broker = hass.data[DOMAIN]["broker"]
+    broker = entry.runtime_data
 
     async_add_entities(
-        [
-            GeniusSwitch(broker, z)
-            for z in broker.client.zone_objs
-            if z.data["type"] == GH_ON_OFF_ZONE
-        ]
+        GeniusSwitch(broker, z)
+        for z in broker.client.zone_objs
+        if z.data.get("type") == GH_ON_OFF_ZONE
     )
 
 
-class GeniusSwitch(GeniusZone, SwitchDevice):
+class GeniusSwitch(GeniusZone, SwitchEntity):
     """Representation of a Genius Hub switch."""
 
     @property
-    def device_class(self):
+    @override
+    def device_class(self) -> SwitchDeviceClass:
         """Return the class of this device, from component DEVICE_CLASSES."""
-        return DEVICE_CLASS_OUTLET
+        return SwitchDeviceClass.OUTLET
 
     @property
+    @override
     def is_on(self) -> bool:
         """Return the current state of the on/off zone.
 
-        The zone is considered 'on' if & only if it is override/on (e.g. timer/on is 'off').
+        The zone is considered 'on' if the mode is either 'override' or 'timer'.
         """
-        return self._zone.data["mode"] == "override" and self._zone.data["setpoint"]
+        return (
+            self._zone.data["mode"] in ["override", "timer"]
+            and self._zone.data["setpoint"]
+        )
 
-    async def async_turn_off(self, **kwargs) -> None:
+    @override
+    async def async_turn_off(self, **kwargs: Any) -> None:
         """Send the zone to Timer mode.
 
         The zone is deemed 'off' in this mode, although the plugs may actually be on.
         """
         await self._zone.set_mode("timer")
 
-    async def async_turn_on(self, **kwargs) -> None:
+    @override
+    async def async_turn_on(self, **kwargs: Any) -> None:
         """Set the zone to override/on ({'setpoint': true}) for x seconds."""
-        await self._zone.set_override(1, kwargs.get(ATTR_DURATION, 3600))
+        duration: timedelta = kwargs.get(
+            GeniusHubServiceArgument.DURATION, timedelta(hours=1)
+        )
+        await self._zone.set_override(1, int(duration.total_seconds()))

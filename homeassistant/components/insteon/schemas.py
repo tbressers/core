@@ -1,156 +1,167 @@
 """Schemas used by insteon component."""
 
-from typing import Dict
-
-import voluptuous as vol
+import probatio
+from pyinsteon.constants import HC_LOOKUP
 
 from homeassistant.const import (
     CONF_ADDRESS,
-    CONF_ENTITY_ID,
+    CONF_DEVICE,
     CONF_HOST,
+    CONF_PASSWORD,
     CONF_PLATFORM,
     CONF_PORT,
+    CONF_USERNAME,
     ENTITY_MATCH_ALL,
-    ENTITY_MATCH_NONE,
+    CommonServiceArgument,
 )
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv
 
 from .const import (
     CONF_CAT,
     CONF_DIM_STEPS,
-    CONF_FIRMWARE,
     CONF_HOUSECODE,
-    CONF_HUB_PASSWORD,
-    CONF_HUB_USERNAME,
     CONF_HUB_VERSION,
-    CONF_IP_PORT,
-    CONF_OVERRIDE,
-    CONF_PLM_HUB_MSG,
-    CONF_PRODUCT_KEY,
     CONF_SUBCAT,
     CONF_UNITCODE,
-    CONF_X10,
-    CONF_X10_ALL_LIGHTS_OFF,
-    CONF_X10_ALL_LIGHTS_ON,
-    CONF_X10_ALL_UNITS_OFF,
-    DOMAIN,
     HOUSECODES,
-    SRV_ALL_LINK_GROUP,
-    SRV_ALL_LINK_MODE,
+    PORT_HUB_V1,
+    PORT_HUB_V2,
     SRV_CONTROLLER,
-    SRV_HOUSECODE,
-    SRV_LOAD_DB_RELOAD,
     SRV_RESPONDER,
+    X10_PLATFORMS,
+    InsteonServiceArgument,
+)
+
+ADD_ALL_LINK_SCHEMA = probatio.Schema(
+    {
+        probatio.Required(InsteonServiceArgument.GROUP): probatio.Byte(),
+        probatio.Required(InsteonServiceArgument.MODE): probatio.In(
+            [SRV_CONTROLLER, SRV_RESPONDER]
+        ),
+    }
 )
 
 
-def set_default_port(schema: Dict) -> Dict:
-    """Set the default port based on the Hub version."""
-    # If the ip_port is found do nothing
-    # If it is not found the set the default
-    ip_port = schema.get(CONF_IP_PORT)
-    if not ip_port:
-        hub_version = schema.get(CONF_HUB_VERSION)
-        # Found hub_version but not ip_port
-        if hub_version == 1:
-            schema[CONF_IP_PORT] = 9761
-        else:
-            schema[CONF_IP_PORT] = 25105
-    return schema
-
-
-CONF_DEVICE_OVERRIDE_SCHEMA = vol.All(
-    cv.deprecated(CONF_PLATFORM),
-    vol.Schema(
-        {
-            vol.Required(CONF_ADDRESS): cv.string,
-            vol.Optional(CONF_CAT): cv.byte,
-            vol.Optional(CONF_SUBCAT): cv.byte,
-            vol.Optional(CONF_FIRMWARE): cv.byte,
-            vol.Optional(CONF_PRODUCT_KEY): cv.byte,
-            vol.Optional(CONF_PLATFORM): cv.string,
-        }
-    ),
+DEL_ALL_LINK_SCHEMA = probatio.Schema(
+    {probatio.Required(InsteonServiceArgument.GROUP): probatio.Byte()}
 )
 
 
-CONF_X10_SCHEMA = vol.All(
-    vol.Schema(
+LOAD_ALDB_SCHEMA = probatio.Schema(
+    {
+        probatio.Required(CommonServiceArgument.ENTITY_ID): probatio.Any(
+            cv.entity_id, ENTITY_MATCH_ALL
+        ),
+        probatio.Optional(InsteonServiceArgument.RELOAD, default=False): cv.boolean,
+    }
+)
+
+
+PRINT_ALDB_SCHEMA = probatio.Schema(
+    {probatio.Required(CommonServiceArgument.ENTITY_ID): cv.entity_id}
+)
+
+
+X10_HOUSECODE_SCHEMA = probatio.Schema(
+    {probatio.Required(InsteonServiceArgument.HOUSECODE): probatio.In(HOUSECODES)}
+)
+
+
+TRIGGER_SCENE_SCHEMA = probatio.Schema(
+    {probatio.Required(InsteonServiceArgument.GROUP): probatio.Byte()}
+)
+
+
+ADD_DEFAULT_LINKS_SCHEMA = probatio.Schema(
+    {probatio.Required(CommonServiceArgument.ENTITY_ID): cv.entity_id}
+)
+
+
+def build_device_override_schema(
+    address=probatio.UNDEFINED,
+    cat=probatio.UNDEFINED,
+    subcat=probatio.UNDEFINED,
+    firmware=probatio.UNDEFINED,
+):
+    """Build the device override schema for config flow."""
+    return probatio.Schema(
         {
-            vol.Required(CONF_HOUSECODE): cv.string,
-            vol.Required(CONF_UNITCODE): vol.Range(min=1, max=16),
-            vol.Required(CONF_PLATFORM): cv.string,
-            vol.Optional(CONF_DIM_STEPS): vol.Range(min=2, max=255),
+            probatio.Required(CONF_ADDRESS, default=address): str,
+            probatio.Optional(CONF_CAT, default=cat): str,
+            probatio.Optional(CONF_SUBCAT, default=subcat): str,
         }
     )
-)
 
 
-CONFIG_SCHEMA = vol.Schema(
-    {
-        DOMAIN: vol.All(
-            vol.Schema(
-                {
-                    vol.Exclusive(
-                        CONF_PORT, "plm_or_hub", msg=CONF_PLM_HUB_MSG
-                    ): cv.string,
-                    vol.Exclusive(
-                        CONF_HOST, "plm_or_hub", msg=CONF_PLM_HUB_MSG
-                    ): cv.string,
-                    vol.Optional(CONF_IP_PORT): cv.port,
-                    vol.Optional(CONF_HUB_USERNAME): cv.string,
-                    vol.Optional(CONF_HUB_PASSWORD): cv.string,
-                    vol.Optional(CONF_HUB_VERSION, default=2): vol.In([1, 2]),
-                    vol.Optional(CONF_OVERRIDE): vol.All(
-                        cv.ensure_list_csv, [CONF_DEVICE_OVERRIDE_SCHEMA]
-                    ),
-                    vol.Optional(CONF_X10_ALL_UNITS_OFF): vol.In(HOUSECODES),
-                    vol.Optional(CONF_X10_ALL_LIGHTS_ON): vol.In(HOUSECODES),
-                    vol.Optional(CONF_X10_ALL_LIGHTS_OFF): vol.In(HOUSECODES),
-                    vol.Optional(CONF_X10): vol.All(
-                        cv.ensure_list_csv, [CONF_X10_SCHEMA]
-                    ),
-                },
-                extra=vol.ALLOW_EXTRA,
-                required=True,
+def build_x10_schema(
+    housecode=probatio.UNDEFINED,
+    unitcode=probatio.UNDEFINED,
+    platform=probatio.UNDEFINED,
+    dim_steps=22,
+):
+    """Build the X10 schema for config flow."""
+    if platform == "light":
+        dim_steps_schema = probatio.Required(CONF_DIM_STEPS, default=dim_steps)
+    else:
+        dim_steps_schema = probatio.Optional(CONF_DIM_STEPS, default=dim_steps)
+    return probatio.Schema(
+        {
+            probatio.Required(CONF_HOUSECODE, default=housecode): probatio.In(
+                HC_LOOKUP.keys()
             ),
-            cv.has_at_least_one_key(CONF_PORT, CONF_HOST),
-            set_default_port,
+            probatio.Required(CONF_UNITCODE, default=unitcode): probatio.In(
+                range(1, 17)
+            ),
+            probatio.Required(CONF_PLATFORM, default=platform): probatio.In(
+                X10_PLATFORMS
+            ),
+            dim_steps_schema: probatio.Byte(),
+        }
+    )
+
+
+def _find_likely_port(ports):
+    """Return the most likely USB port for a PLM."""
+    test_strings = ["FTDI", "0403:6001", "10BF:"]
+    for port, name in ports.items():
+        for test_string in test_strings:
+            if test_string in name:
+                return port
+    return probatio.UNDEFINED
+
+
+def build_plm_schema(ports: dict[str, str], device=probatio.UNDEFINED):
+    """Build the PLM schema for config flow."""
+    if not device or device == probatio.UNDEFINED:
+        device = _find_likely_port(ports)
+    return probatio.Schema(
+        {probatio.Required(CONF_DEVICE, default=device): probatio.In(ports)}
+    )
+
+
+def build_plm_manual_schema(device=probatio.UNDEFINED):
+    """Build the manual PLM schema for config flow."""
+    return probatio.Schema({probatio.Required(CONF_DEVICE, default=device): str})
+
+
+def build_hub_schema(
+    hub_version,
+    host=probatio.UNDEFINED,
+    port=probatio.UNDEFINED,
+    username=probatio.UNDEFINED,
+    password=probatio.UNDEFINED,
+):
+    """Build the Hub schema for config flow."""
+    if port == probatio.UNDEFINED:
+        port = PORT_HUB_V2 if hub_version == 2 else PORT_HUB_V1
+    schema = {
+        probatio.Required(CONF_HOST, default=host): str,
+        probatio.Required(CONF_PORT, default=port): int,
+        probatio.Required(CONF_HUB_VERSION, default=hub_version): int,
+    }
+    if hub_version == 2:
+        schema[probatio.Required(CONF_USERNAME, default=username)] = str
+        schema[probatio.Required(probatio.Secret(CONF_PASSWORD), default=password)] = (
+            str
         )
-    },
-    extra=vol.ALLOW_EXTRA,
-)
-
-
-ADD_ALL_LINK_SCHEMA = vol.Schema(
-    {
-        vol.Required(SRV_ALL_LINK_GROUP): vol.Range(min=0, max=255),
-        vol.Required(SRV_ALL_LINK_MODE): vol.In([SRV_CONTROLLER, SRV_RESPONDER]),
-    }
-)
-
-
-DEL_ALL_LINK_SCHEMA = vol.Schema(
-    {vol.Required(SRV_ALL_LINK_GROUP): vol.Range(min=0, max=255)}
-)
-
-
-LOAD_ALDB_SCHEMA = vol.Schema(
-    {
-        vol.Required(CONF_ENTITY_ID): vol.Any(
-            cv.entity_id, ENTITY_MATCH_ALL, ENTITY_MATCH_NONE
-        ),
-        vol.Optional(SRV_LOAD_DB_RELOAD, default=False): cv.boolean,
-    }
-)
-
-
-PRINT_ALDB_SCHEMA = vol.Schema({vol.Required(CONF_ENTITY_ID): cv.entity_id})
-
-
-X10_HOUSECODE_SCHEMA = vol.Schema({vol.Required(SRV_HOUSECODE): vol.In(HOUSECODES)})
-
-
-TRIGGER_SCENE_SCHEMA = vol.Schema(
-    {vol.Required(SRV_ALL_LINK_GROUP): vol.Range(min=0, max=255)}
-)
+    return probatio.Schema(schema)

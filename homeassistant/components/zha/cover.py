@@ -1,160 +1,196 @@
 """Support for ZHA covers."""
-from datetime import timedelta
+
 import functools
 import logging
+from typing import Any, override
 
-from zigpy.zcl.foundation import Status
-
-from homeassistant.components.cover import ATTR_POSITION, DOMAIN, CoverDevice
-from homeassistant.const import STATE_CLOSED, STATE_CLOSING, STATE_OPEN, STATE_OPENING
-from homeassistant.core import callback
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
-
-from .core import discovery
-from .core.const import (
-    CHANNEL_COVER,
-    DATA_ZHA,
-    DATA_ZHA_DISPATCHERS,
-    SIGNAL_ADD_ENTITIES,
-    SIGNAL_ATTR_UPDATED,
+from zha.application.platforms.cover import Shade as ZhaShade
+from zha.application.platforms.cover.const import (
+    CoverEntityFeature as ZHACoverEntityFeature,
 )
-from .core.registries import ZHA_ENTITIES
-from .entity import ZhaEntity
+
+from homeassistant.components.cover import (
+    ATTR_POSITION,
+    ATTR_TILT_POSITION,
+    CoverDeviceClass,
+    CoverEntity,
+    CoverEntityFeature,
+)
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant, State, callback
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+
+from .entity import ZHASupportedFeaturesEntity
+from .helpers import (
+    SIGNAL_ADD_ENTITIES,
+    async_add_entities as zha_async_add_entities,
+    convert_zha_error_to_ha_error,
+    get_zha_data,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-SCAN_INTERVAL = timedelta(minutes=60)
-STRICT_MATCH = functools.partial(ZHA_ENTITIES.strict_match, DOMAIN)
 
-
-async def async_setup_entry(hass, config_entry, async_add_entities):
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
     """Set up the Zigbee Home Automation cover from config entry."""
-    entities_to_create = hass.data[DATA_ZHA][DOMAIN] = []
+    zha_data = get_zha_data(hass)
+    entities_to_create = zha_data.platforms[Platform.COVER]
 
     unsub = async_dispatcher_connect(
         hass,
         SIGNAL_ADD_ENTITIES,
         functools.partial(
-            discovery.async_add_entities, async_add_entities, entities_to_create
+            zha_async_add_entities, async_add_entities, ZhaCover, entities_to_create
         ),
     )
-    hass.data[DATA_ZHA][DATA_ZHA_DISPATCHERS].append(unsub)
+    config_entry.async_on_unload(unsub)
 
 
-@STRICT_MATCH(channel_names=CHANNEL_COVER)
-class ZhaCover(ZhaEntity, CoverDevice):
+class ZhaCover(ZHASupportedFeaturesEntity, CoverEntity):
     """Representation of a ZHA cover."""
 
-    def __init__(self, unique_id, zha_device, channels, **kwargs):
-        """Init this sensor."""
-        super().__init__(unique_id, zha_device, channels, **kwargs)
-        self._cover_channel = self.cluster_channels.get(CHANNEL_COVER)
-        self._current_position = None
+    @staticmethod
+    @functools.cache
+    @override
+    def _convert_supported_features(
+        zha_features: ZHACoverEntityFeature,
+    ) -> CoverEntityFeature:
+        """Convert ZHA cover features to HA cover features."""
+        features = CoverEntityFeature(0)
 
-    async def async_added_to_hass(self):
-        """Run when about to be added to hass."""
-        await super().async_added_to_hass()
-        await self.async_accept_signal(
-            self._cover_channel, SIGNAL_ATTR_UPDATED, self.async_set_position
+        if ZHACoverEntityFeature.OPEN in zha_features:
+            features |= CoverEntityFeature.OPEN
+        if ZHACoverEntityFeature.CLOSE in zha_features:
+            features |= CoverEntityFeature.CLOSE
+        if ZHACoverEntityFeature.SET_POSITION in zha_features:
+            features |= CoverEntityFeature.SET_POSITION
+        if ZHACoverEntityFeature.STOP in zha_features:
+            features |= CoverEntityFeature.STOP
+        if ZHACoverEntityFeature.OPEN_TILT in zha_features:
+            features |= CoverEntityFeature.OPEN_TILT
+        if ZHACoverEntityFeature.CLOSE_TILT in zha_features:
+            features |= CoverEntityFeature.CLOSE_TILT
+        if ZHACoverEntityFeature.STOP_TILT in zha_features:
+            features |= CoverEntityFeature.STOP_TILT
+        if ZHACoverEntityFeature.SET_TILT_POSITION in zha_features:
+            features |= CoverEntityFeature.SET_TILT_POSITION
+
+        return features
+
+    @override
+    def _update_capability_attrs(self) -> None:
+        """Re-derive capability attributes from the cached state."""
+        super()._update_capability_attrs()
+
+        device_class = self._zha_state.device_class
+        self._attr_device_class = (
+            CoverDeviceClass(device_class) if device_class is not None else None
         )
 
-    @callback
-    def async_restore_last_state(self, last_state):
-        """Restore previous state."""
-        self._state = last_state.state
-        if "current_position" in last_state.attributes:
-            self._current_position = last_state.attributes["current_position"]
+    @property
+    @override
+    def is_closed(self) -> bool | None:
+        """Return True if the cover is closed."""
+        return self._zha_state.is_closed
 
     @property
-    def is_closed(self):
-        """Return if the cover is closed."""
-        if self.current_cover_position is None:
-            return None
-        return self.current_cover_position == 0
-
-    @property
-    def is_opening(self):
+    @override
+    def is_opening(self) -> bool:
         """Return if the cover is opening or not."""
-        return self._state == STATE_OPENING
+        return self._zha_state.is_opening
 
     @property
-    def is_closing(self):
+    @override
+    def is_closing(self) -> bool:
         """Return if the cover is closing or not."""
-        return self._state == STATE_CLOSING
+        return self._zha_state.is_closing
 
     @property
-    def current_cover_position(self):
-        """Return the current position of ZHA cover.
+    @override
+    def current_cover_position(self) -> int | None:
+        """Return the current position of ZHA cover."""
+        return self._zha_state.current_position
 
-        None is unknown, 0 is closed, 100 is fully open.
-        """
-        return self._current_position
+    @property
+    @override
+    def current_cover_tilt_position(self) -> int | None:
+        """Return the current tilt position of the cover."""
+        return self._zha_state.current_tilt_position
+
+    @convert_zha_error_to_ha_error()
+    @override
+    async def async_open_cover(self, **kwargs: Any) -> None:
+        """Open the cover."""
+        await self.entity_data.entity.async_open_cover()
+        self.async_write_ha_state()
+
+    @convert_zha_error_to_ha_error()
+    @override
+    async def async_open_cover_tilt(self, **kwargs: Any) -> None:
+        """Open the cover tilt."""
+        await self.entity_data.entity.async_open_cover_tilt()
+        self.async_write_ha_state()
+
+    @convert_zha_error_to_ha_error()
+    @override
+    async def async_close_cover(self, **kwargs: Any) -> None:
+        """Close the cover."""
+        await self.entity_data.entity.async_close_cover()
+        self.async_write_ha_state()
+
+    @convert_zha_error_to_ha_error()
+    @override
+    async def async_close_cover_tilt(self, **kwargs: Any) -> None:
+        """Close the cover tilt."""
+        await self.entity_data.entity.async_close_cover_tilt()
+        self.async_write_ha_state()
+
+    @convert_zha_error_to_ha_error()
+    @override
+    async def async_set_cover_position(self, **kwargs: Any) -> None:
+        """Move the cover to a specific position."""
+        await self.entity_data.entity.async_set_cover_position(
+            position=kwargs.get(ATTR_POSITION)
+        )
+        self.async_write_ha_state()
+
+    @convert_zha_error_to_ha_error()
+    @override
+    async def async_set_cover_tilt_position(self, **kwargs: Any) -> None:
+        """Move the cover tilt to a specific position."""
+        await self.entity_data.entity.async_set_cover_tilt_position(
+            tilt_position=kwargs.get(ATTR_TILT_POSITION)
+        )
+        self.async_write_ha_state()
+
+    @convert_zha_error_to_ha_error()
+    @override
+    async def async_stop_cover(self, **kwargs: Any) -> None:
+        """Stop the cover."""
+        await self.entity_data.entity.async_stop_cover()
+        self.async_write_ha_state()
+
+    @convert_zha_error_to_ha_error()
+    @override
+    async def async_stop_cover_tilt(self, **kwargs: Any) -> None:
+        """Stop the cover tilt."""
+        await self.entity_data.entity.async_stop_cover_tilt()
+        self.async_write_ha_state()
 
     @callback
-    def async_set_position(self, pos):
-        """Handle position update from channel."""
-        _LOGGER.debug("setting position: %s", pos)
-        self._current_position = 100 - pos
-        if self._current_position == 0:
-            self._state = STATE_CLOSED
-        elif self._current_position == 100:
-            self._state = STATE_OPEN
-        self.async_schedule_update_ha_state()
+    @override
+    def restore_external_state_attributes(self, state: State) -> None:
+        """Restore entity state."""
 
-    @callback
-    def async_set_state(self, state):
-        """Handle state update from channel."""
-        _LOGGER.debug("state=%s", state)
-        self._state = state
-        self.async_schedule_update_ha_state()
+        # Shades are a subtype of cover that do not need external state restored
+        if isinstance(self.entity_data.entity, ZhaShade):
+            return
 
-    async def async_open_cover(self, **kwargs):
-        """Open the window cover."""
-        res = await self._cover_channel.up_open()
-        if isinstance(res, list) and res[1] is Status.SUCCESS:
-            self.async_set_state(STATE_OPENING)
-
-    async def async_close_cover(self, **kwargs):
-        """Close the window cover."""
-        res = await self._cover_channel.down_close()
-        if isinstance(res, list) and res[1] is Status.SUCCESS:
-            self.async_set_state(STATE_CLOSING)
-
-    async def async_set_cover_position(self, **kwargs):
-        """Move the roller shutter to a specific position."""
-        new_pos = kwargs[ATTR_POSITION]
-        res = await self._cover_channel.go_to_lift_percentage(100 - new_pos)
-        if isinstance(res, list) and res[1] is Status.SUCCESS:
-            self.async_set_state(
-                STATE_CLOSING if new_pos < self._current_position else STATE_OPENING
-            )
-
-    async def async_stop_cover(self, **kwargs):
-        """Stop the window cover."""
-        res = await self._cover_channel.stop()
-        if isinstance(res, list) and res[1] is Status.SUCCESS:
-            self._state = STATE_OPEN if self._current_position > 0 else STATE_CLOSED
-            self.async_schedule_update_ha_state()
-
-    async def async_update(self):
-        """Attempt to retrieve the open/close state of the cover."""
-        await super().async_update()
-        await self.async_get_state()
-
-    async def async_get_state(self, from_cache=True):
-        """Fetch the current state."""
-        _LOGGER.debug("polling current state")
-        if self._cover_channel:
-            pos = await self._cover_channel.get_attribute_value(
-                "current_position_lift_percentage", from_cache=from_cache
-            )
-            _LOGGER.debug("read pos=%s", pos)
-
-            if pos is not None:
-                self._current_position = 100 - pos
-                self._state = (
-                    STATE_OPEN if self.current_cover_position > 0 else STATE_CLOSED
-                )
-            else:
-                self._current_position = None
-                self._state = None
+        # Same as `light`, some entity state is not derived from ZCL attributes
+        self.entity_data.entity.restore_external_state_attributes(state=state.state)

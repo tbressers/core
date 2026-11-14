@@ -1,17 +1,18 @@
-"""Constants for the Elgato Key Light integration."""
+"""Constants for the Elgato Light integration."""
+
+from datetime import timedelta
+import logging
+from typing import Final
 
 # Integration domain
-DOMAIN = "elgato"
+DOMAIN: Final = "elgato"
 
-# Home Assistant data keys
-DATA_ELGATO_CLIENT = "elgato_client"
+LOGGER = logging.getLogger(__package__)
+SCAN_INTERVAL = timedelta(seconds=10)
+
+# Elgato publishes firmware a handful of times a year, bundled with a new
+# Control Center release. Asking more often than this buys nothing.
+FIRMWARE_SCAN_INTERVAL = timedelta(hours=12)
 
 # Attributes
-ATTR_IDENTIFIERS = "identifiers"
-ATTR_MANUFACTURER = "manufacturer"
-ATTR_MODEL = "model"
 ATTR_ON = "on"
-ATTR_SOFTWARE_VERSION = "sw_version"
-ATTR_TEMPERATURE = "temperature"
-
-CONF_SERIAL_NUMBER = "serial_number"

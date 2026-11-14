@@ -1,34 +1,44 @@
 """Support for OhmConnect."""
+
 from datetime import timedelta
 import logging
+from typing import Any, override
 
 import defusedxml.ElementTree as ET
+import probatio
 import requests
-import voluptuous as vol
 
-from homeassistant.components.sensor import PLATFORM_SCHEMA
-from homeassistant.const import CONF_NAME
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.entity import Entity
+from homeassistant.components.sensor import (
+    PLATFORM_SCHEMA as SENSOR_PLATFORM_SCHEMA,
+    SensorEntity,
+)
+from homeassistant.const import CONF_ID, CONF_NAME
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 from homeassistant.util import Throttle
 
 _LOGGER = logging.getLogger(__name__)
-
-CONF_ID = "id"
 
 DEFAULT_NAME = "OhmConnect Status"
 
 MIN_TIME_BETWEEN_UPDATES = timedelta(minutes=1)
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = SENSOR_PLATFORM_SCHEMA.extend(
     {
-        vol.Required(CONF_ID): cv.string,
-        vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
+        probatio.Required(CONF_ID): cv.string,
+        probatio.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
     }
 )
 
 
-def setup_platform(hass, config, add_entities, discovery_info=None):
+def setup_platform(
+    hass: HomeAssistant,
+    config: ConfigType,
+    add_entities: AddEntitiesCallback,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> None:
     """Set up the OhmConnect sensor."""
     name = config.get(CONF_NAME)
     ohmid = config.get(CONF_ID)
@@ -36,7 +46,7 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
     add_entities([OhmconnectSensor(name, ohmid)], True)
 
 
-class OhmconnectSensor(Entity):
+class OhmconnectSensor(SensorEntity):
     """Representation of a OhmConnect sensor."""
 
     def __init__(self, name, ohmid):
@@ -44,29 +54,33 @@ class OhmconnectSensor(Entity):
         self._name = name
         self._ohmid = ohmid
         self._data = {}
+        self._attr_unique_id = ohmid
 
     @property
+    @override
     def name(self):
         """Return the name of the sensor."""
         return self._name
 
     @property
-    def state(self):
+    @override
+    def native_value(self):
         """Return the state of the sensor."""
         if self._data.get("active") == "True":
             return "Active"
         return "Inactive"
 
     @property
-    def device_state_attributes(self):
+    @override
+    def extra_state_attributes(self) -> dict[str, Any]:
         """Return the state attributes."""
         return {"Address": self._data.get("address"), "ID": self._ohmid}
 
     @Throttle(MIN_TIME_BETWEEN_UPDATES)
-    def update(self):
+    def update(self) -> None:
         """Get the latest data from OhmConnect."""
         try:
-            url = "https://login.ohmconnect.com/verify-ohm-hour/{}".format(self._ohmid)
+            url = f"https://login.ohmconnect.com/verify-ohm-hour/{self._ohmid}"
             response = requests.get(url, timeout=10)
             root = ET.fromstring(response.text)
 

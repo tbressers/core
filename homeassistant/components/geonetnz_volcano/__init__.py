@@ -1,60 +1,82 @@
 """The GeoNet NZ Volcano integration."""
-import asyncio
-from datetime import datetime, timedelta
+
+from datetime import datetime
 import logging
-from typing import Optional
 
 from aio_geojson_geonetnz_volcano import GeonetnzVolcanoFeedManager
-import voluptuous as vol
+import probatio
 
-from homeassistant.config_entries import SOURCE_IMPORT
+from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
 from homeassistant.const import (
     CONF_LATITUDE,
     CONF_LONGITUDE,
     CONF_RADIUS,
     CONF_SCAN_INTERVAL,
     CONF_UNIT_SYSTEM,
-    CONF_UNIT_SYSTEM_IMPERIAL,
-    LENGTH_MILES,
+    UnitOfLength,
 )
-from homeassistant.core import callback
+from homeassistant.core import DOMAIN as HOMEASSISTANT_DOMAIN, HomeAssistant, callback
 from homeassistant.helpers import aiohttp_client, config_validation as cv
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_track_time_interval
-from homeassistant.util.unit_system import METRIC_SYSTEM
+from homeassistant.helpers.issue_registry import IssueSeverity, async_create_issue
+from homeassistant.helpers.typing import ConfigType
+from homeassistant.util.unit_conversion import DistanceConverter
 
 from .config_flow import configured_instances
-from .const import DEFAULT_RADIUS, DEFAULT_SCAN_INTERVAL, DOMAIN, FEED
+from .const import (
+    DEFAULT_RADIUS,
+    DEFAULT_SCAN_INTERVAL,
+    DOMAIN,
+    IMPERIAL_UNITS,
+    PLATFORMS,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-CONFIG_SCHEMA = vol.Schema(
+CONFIG_SCHEMA = probatio.Schema(
     {
-        DOMAIN: vol.Schema(
+        DOMAIN: probatio.Schema(
             {
-                vol.Optional(CONF_LATITUDE): cv.latitude,
-                vol.Optional(CONF_LONGITUDE): cv.longitude,
-                vol.Optional(CONF_RADIUS, default=DEFAULT_RADIUS): vol.Coerce(float),
-                vol.Optional(
+                probatio.Optional(CONF_LATITUDE): cv.latitude,
+                probatio.Optional(CONF_LONGITUDE): cv.longitude,
+                probatio.Optional(CONF_RADIUS, default=DEFAULT_RADIUS): probatio.Coerce(
+                    float
+                ),
+                probatio.Optional(
                     CONF_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL
                 ): cv.time_period,
             }
         )
     },
-    extra=vol.ALLOW_EXTRA,
+    extra=probatio.ALLOW_EXTRA,
 )
 
+type GeonetnzVolcanoConfigEntry = ConfigEntry[GeonetnzVolcanoFeedEntityManager]
 
-async def async_setup(hass, config):
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the GeoNet NZ Volcano component."""
     if DOMAIN not in config:
         return True
-
+    async_create_issue(
+        hass,
+        HOMEASSISTANT_DOMAIN,
+        f"deprecated_yaml_{DOMAIN}",
+        breaks_in_ha_version="2027.6.0",
+        is_fixable=False,
+        issue_domain=DOMAIN,
+        severity=IssueSeverity.WARNING,
+        translation_key="deprecated_yaml",
+        translation_placeholders={
+            "domain": DOMAIN,
+            "integration_title": "GeoNet NZ Volcano",
+        },
+    )
     conf = config[DOMAIN]
 
     latitude = conf.get(CONF_LATITUDE, hass.config.latitude)
     longitude = conf.get(CONF_LONGITUDE, hass.config.longitude)
-    scan_interval = conf[CONF_SCAN_INTERVAL]
 
     identifier = f"{latitude}, {longitude}"
     if identifier in configured_instances(hass):
@@ -68,7 +90,6 @@ async def async_setup(hass, config):
                 CONF_LATITUDE: latitude,
                 CONF_LONGITUDE: longitude,
                 CONF_RADIUS: conf[CONF_RADIUS],
-                CONF_SCAN_INTERVAL: scan_interval,
             },
         )
     )
@@ -76,31 +97,29 @@ async def async_setup(hass, config):
     return True
 
 
-async def async_setup_entry(hass, config_entry):
+async def async_setup_entry(
+    hass: HomeAssistant, config_entry: GeonetnzVolcanoConfigEntry
+) -> None:
     """Set up the GeoNet NZ Volcano component as config entry."""
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN].setdefault(FEED, {})
-
     radius = config_entry.data[CONF_RADIUS]
     unit_system = config_entry.data[CONF_UNIT_SYSTEM]
-    if unit_system == CONF_UNIT_SYSTEM_IMPERIAL:
-        radius = METRIC_SYSTEM.length(radius, LENGTH_MILES)
+    if unit_system == IMPERIAL_UNITS:
+        radius = DistanceConverter.convert(
+            radius, UnitOfLength.MILES, UnitOfLength.KILOMETERS
+        )
     # Create feed entity manager for all platforms.
     manager = GeonetnzVolcanoFeedEntityManager(hass, config_entry, radius, unit_system)
-    hass.data[DOMAIN][FEED][config_entry.entry_id] = manager
+    config_entry.runtime_data = manager
     _LOGGER.debug("Feed entity manager added for %s", config_entry.entry_id)
     await manager.async_init()
-    return True
 
 
-async def async_unload_entry(hass, config_entry):
+async def async_unload_entry(
+    hass: HomeAssistant, entry: GeonetnzVolcanoConfigEntry
+) -> None:
     """Unload an GeoNet NZ Volcano component config entry."""
-    manager = hass.data[DOMAIN][FEED].pop(config_entry.entry_id)
-    await manager.async_stop()
-    await asyncio.wait(
-        [hass.config_entries.async_forward_entry_unload(config_entry, "sensor")]
-    )
-    return True
+    await entry.runtime_data.async_stop()
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
 
 
 class GeonetnzVolcanoFeedEntityManager:
@@ -124,7 +143,6 @@ class GeonetnzVolcanoFeedEntityManager:
             filter_radius=radius_in_km,
         )
         self._config_entry_id = config_entry.entry_id
-        self._scan_interval = timedelta(seconds=config_entry.data[CONF_SCAN_INTERVAL])
         self._unit_system = unit_system
         self._track_time_remove_callback = None
         self.listeners = []
@@ -132,10 +150,8 @@ class GeonetnzVolcanoFeedEntityManager:
     async def async_init(self):
         """Schedule initial and regular updates based on configured time interval."""
 
-        self._hass.async_create_task(
-            self._hass.config_entries.async_forward_entry_setup(
-                self._config_entry, "sensor"
-            )
+        await self._hass.config_entries.async_forward_entry_setups(
+            self._config_entry, PLATFORMS
         )
 
         async def update(event_time):
@@ -144,7 +160,7 @@ class GeonetnzVolcanoFeedEntityManager:
 
         # Trigger updates at regular intervals.
         self._track_time_remove_callback = async_track_time_interval(
-            self._hass, update, self._scan_interval
+            self._hass, update, DEFAULT_SCAN_INTERVAL
         )
 
         _LOGGER.debug("Feed entity manager initialized")
@@ -172,11 +188,11 @@ class GeonetnzVolcanoFeedEntityManager:
         """Get feed entry by external id."""
         return self._feed_manager.feed_entries.get(external_id)
 
-    def last_update(self) -> Optional[datetime]:
+    def last_update(self) -> datetime | None:
         """Return the last update of this feed."""
         return self._feed_manager.last_update
 
-    def last_update_successful(self) -> Optional[datetime]:
+    def last_update_successful(self) -> datetime | None:
         """Return the last successful update of this feed."""
         return self._feed_manager.last_update_successful
 

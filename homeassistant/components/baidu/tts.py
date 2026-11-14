@@ -1,17 +1,26 @@
 """Support for Baidu speech service."""
+
+from enum import StrEnum
 import logging
+from typing import Any, override
 
 from aip import AipSpeech
-import voluptuous as vol
+import probatio
 
-from homeassistant.components.tts import CONF_LANG, PLATFORM_SCHEMA, Provider
+from homeassistant.components.tts import (
+    CONF_LANG,
+    PLATFORM_SCHEMA as TTS_PLATFORM_SCHEMA,
+    Provider,
+    TtsAudioType,
+)
 from homeassistant.const import CONF_API_KEY
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv
 
 _LOGGER = logging.getLogger(__name__)
 
 SUPPORTED_LANGUAGES = ["zh"]
 DEFAULT_LANG = "zh"
+SUPPORTED_PERSON = [0, 1, 3, 4, 5, 103, 106, 110, 111, 5003, 5118]
 
 CONF_APP_ID = "app_id"
 CONF_SECRET_KEY = "secret_key"
@@ -20,24 +29,34 @@ CONF_PITCH = "pitch"
 CONF_VOLUME = "volume"
 CONF_PERSON = "person"
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+
+class BaiduTextToSpeechOption(StrEnum):
+    """Store keys for the Baidu text-to-speech options."""
+
+    PERSON = "person"
+    PITCH = "pitch"
+    SPEED = "speed"
+    VOLUME = "volume"
+
+
+PLATFORM_SCHEMA = TTS_PLATFORM_SCHEMA.extend(
     {
-        vol.Optional(CONF_LANG, default=DEFAULT_LANG): vol.In(SUPPORTED_LANGUAGES),
-        vol.Required(CONF_APP_ID): cv.string,
-        vol.Required(CONF_API_KEY): cv.string,
-        vol.Required(CONF_SECRET_KEY): cv.string,
-        vol.Optional(CONF_SPEED, default=5): vol.All(
-            vol.Coerce(int), vol.Range(min=0, max=9)
+        probatio.Optional(CONF_LANG, default=DEFAULT_LANG): probatio.In(
+            SUPPORTED_LANGUAGES
         ),
-        vol.Optional(CONF_PITCH, default=5): vol.All(
-            vol.Coerce(int), vol.Range(min=0, max=9)
+        probatio.Required(CONF_APP_ID): cv.string,
+        probatio.Required(probatio.Secret(CONF_API_KEY)): cv.string,
+        probatio.Required(probatio.Secret(CONF_SECRET_KEY)): cv.string,
+        probatio.Optional(CONF_SPEED, default=5): probatio.All(
+            probatio.Coerce(int), probatio.Range(min=0, max=9)
         ),
-        vol.Optional(CONF_VOLUME, default=5): vol.All(
-            vol.Coerce(int), vol.Range(min=0, max=15)
+        probatio.Optional(CONF_PITCH, default=5): probatio.All(
+            probatio.Coerce(int), probatio.Range(min=0, max=9)
         ),
-        vol.Optional(CONF_PERSON, default=0): vol.All(
-            vol.Coerce(int), vol.Range(min=0, max=4)
+        probatio.Optional(CONF_VOLUME, default=5): probatio.All(
+            probatio.Coerce(int), probatio.Range(min=0, max=15)
         ),
+        probatio.Optional(CONF_PERSON, default=0): probatio.In(SUPPORTED_PERSON),
     }
 )
 
@@ -49,7 +68,12 @@ _OPTIONS = {
     CONF_SPEED: "spd",
     CONF_VOLUME: "vol",
 }
-SUPPORTED_OPTIONS = [CONF_PERSON, CONF_PITCH, CONF_SPEED, CONF_VOLUME]
+SUPPORTED_OPTIONS: list[str] = [
+    BaiduTextToSpeechOption.PERSON,
+    BaiduTextToSpeechOption.PITCH,
+    BaiduTextToSpeechOption.SPEED,
+    BaiduTextToSpeechOption.VOLUME,
+]
 
 
 def get_engine(hass, config, discovery_info=None):
@@ -63,49 +87,63 @@ class BaiduTTSProvider(Provider):
     def __init__(self, hass, conf):
         """Init Baidu TTS service."""
         self.hass = hass
-        self._lang = conf.get(CONF_LANG)
+        self._lang = conf[CONF_LANG]
         self._codec = "mp3"
         self.name = "BaiduTTS"
 
         self._app_data = {
-            "appid": conf.get(CONF_APP_ID),
-            "apikey": conf.get(CONF_API_KEY),
-            "secretkey": conf.get(CONF_SECRET_KEY),
+            "appid": conf[CONF_APP_ID],
+            "apikey": conf[CONF_API_KEY],
+            "secretkey": conf[CONF_SECRET_KEY],
         }
 
         self._speech_conf_data = {
-            _OPTIONS[CONF_PERSON]: conf.get(CONF_PERSON),
-            _OPTIONS[CONF_PITCH]: conf.get(CONF_PITCH),
-            _OPTIONS[CONF_SPEED]: conf.get(CONF_SPEED),
-            _OPTIONS[CONF_VOLUME]: conf.get(CONF_VOLUME),
+            _OPTIONS[CONF_PERSON]: conf[CONF_PERSON],
+            _OPTIONS[CONF_PITCH]: conf[CONF_PITCH],
+            _OPTIONS[CONF_SPEED]: conf[CONF_SPEED],
+            _OPTIONS[CONF_VOLUME]: conf[CONF_VOLUME],
         }
 
     @property
-    def default_language(self):
+    @override
+    def default_language(self) -> str:
         """Return the default language."""
         return self._lang
 
     @property
-    def supported_languages(self):
+    @override
+    def supported_languages(self) -> list[str]:
         """Return a list of supported languages."""
         return SUPPORTED_LANGUAGES
 
     @property
-    def default_options(self):
+    @override
+    def default_options(self) -> dict[str, Any]:
         """Return a dict including default options."""
         return {
-            CONF_PERSON: self._speech_conf_data[_OPTIONS[CONF_PERSON]],
-            CONF_PITCH: self._speech_conf_data[_OPTIONS[CONF_PITCH]],
-            CONF_SPEED: self._speech_conf_data[_OPTIONS[CONF_SPEED]],
-            CONF_VOLUME: self._speech_conf_data[_OPTIONS[CONF_VOLUME]],
+            BaiduTextToSpeechOption.PERSON: self._speech_conf_data[
+                _OPTIONS[CONF_PERSON]
+            ],
+            BaiduTextToSpeechOption.PITCH: self._speech_conf_data[_OPTIONS[CONF_PITCH]],
+            BaiduTextToSpeechOption.SPEED: self._speech_conf_data[_OPTIONS[CONF_SPEED]],
+            BaiduTextToSpeechOption.VOLUME: self._speech_conf_data[
+                _OPTIONS[CONF_VOLUME]
+            ],
         }
 
     @property
-    def supported_options(self):
+    @override
+    def supported_options(self) -> list[str]:
         """Return a list of supported options."""
         return SUPPORTED_OPTIONS
 
-    def get_tts_audio(self, message, language, options=None):
+    @override
+    def get_tts_audio(
+        self,
+        message: str,
+        language: str,
+        options: dict[str, Any],
+    ) -> TtsAudioType:
         """Load TTS from BaiduTTS."""
 
         aip_speech = AipSpeech(
@@ -114,14 +152,11 @@ class BaiduTTSProvider(Provider):
             self._app_data["secretkey"],
         )
 
-        if options is None:
-            result = aip_speech.synthesis(message, language, 1, self._speech_conf_data)
-        else:
-            speech_data = self._speech_conf_data.copy()
-            for key, value in options.items():
-                speech_data[_OPTIONS[key]] = value
+        speech_data = self._speech_conf_data.copy()
+        for key, value in options.items():
+            speech_data[_OPTIONS[key]] = value
 
-            result = aip_speech.synthesis(message, language, 1, speech_data)
+        result = aip_speech.synthesis(message, language, 1, speech_data)
 
         if isinstance(result, dict):
             _LOGGER.error(

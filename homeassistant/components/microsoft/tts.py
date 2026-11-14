@@ -1,13 +1,22 @@
 """Support for the Microsoft Cognitive Services text-to-speech service."""
-from http.client import HTTPException
+
+from enum import StrEnum
 import logging
+from typing import Any, override
 
+import probatio
 from pycsspeechtts import pycsspeechtts
-import voluptuous as vol
+from requests.exceptions import HTTPError
 
-from homeassistant.components.tts import CONF_LANG, PLATFORM_SCHEMA, Provider
-from homeassistant.const import CONF_API_KEY, CONF_TYPE, UNIT_PERCENTAGE
-import homeassistant.helpers.config_validation as cv
+from homeassistant.components.tts import (
+    CONF_LANG,
+    PLATFORM_SCHEMA as TTS_PLATFORM_SCHEMA,
+    Provider,
+    TtsAudioType,
+)
+from homeassistant.const import CONF_API_KEY, CONF_REGION, CONF_TYPE, PERCENTAGE
+from homeassistant.generated.microsoft_tts import SUPPORTED_LANGUAGES
+from homeassistant.helpers import config_validation as cv
 
 CONF_GENDER = "gender"
 CONF_OUTPUT = "output"
@@ -15,82 +24,45 @@ CONF_RATE = "rate"
 CONF_VOLUME = "volume"
 CONF_PITCH = "pitch"
 CONF_CONTOUR = "contour"
-CONF_REGION = "region"
-
 _LOGGER = logging.getLogger(__name__)
-
-SUPPORTED_LANGUAGES = [
-    "ar-eg",
-    "ar-sa",
-    "ca-es",
-    "cs-cz",
-    "da-dk",
-    "de-at",
-    "de-ch",
-    "de-de",
-    "el-gr",
-    "en-au",
-    "en-ca",
-    "en-gb",
-    "en-ie",
-    "en-in",
-    "en-us",
-    "es-es",
-    "es-mx",
-    "fi-fi",
-    "fr-ca",
-    "fr-ch",
-    "fr-fr",
-    "he-il",
-    "hi-in",
-    "hu-hu",
-    "id-id",
-    "it-it",
-    "ja-jp",
-    "ko-kr",
-    "nb-no",
-    "nl-nl",
-    "pl-pl",
-    "pt-br",
-    "pt-pt",
-    "ro-ro",
-    "ru-ru",
-    "sk-sk",
-    "sv-se",
-    "th-th",
-    "tr-tr",
-    "zh-cn",
-    "zh-hk",
-    "zh-tw",
-]
 
 GENDERS = ["Female", "Male"]
 
 DEFAULT_LANG = "en-us"
 DEFAULT_GENDER = "Female"
-DEFAULT_TYPE = "ZiraRUS"
-DEFAULT_OUTPUT = "audio-16khz-128kbitrate-mono-mp3"
+DEFAULT_TYPE = "JennyNeural"
+DEFAULT_OUTPUT = "audio-24khz-96kbitrate-mono-mp3"
 DEFAULT_RATE = 0
 DEFAULT_VOLUME = 0
 DEFAULT_PITCH = "default"
 DEFAULT_CONTOUR = ""
 DEFAULT_REGION = "eastus"
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+
+class MicrosoftTextToSpeechOption(StrEnum):
+    """Store keys for the Microsoft text-to-speech options."""
+
+    GENDER = "gender"
+    TYPE = "type"
+
+
+PLATFORM_SCHEMA = TTS_PLATFORM_SCHEMA.extend(
     {
-        vol.Required(CONF_API_KEY): cv.string,
-        vol.Optional(CONF_LANG, default=DEFAULT_LANG): vol.In(SUPPORTED_LANGUAGES),
-        vol.Optional(CONF_GENDER, default=DEFAULT_GENDER): vol.In(GENDERS),
-        vol.Optional(CONF_TYPE, default=DEFAULT_TYPE): cv.string,
-        vol.Optional(CONF_RATE, default=DEFAULT_RATE): vol.All(
-            vol.Coerce(int), vol.Range(-100, 100)
+        probatio.Required(probatio.Secret(CONF_API_KEY)): cv.string,
+        probatio.Optional(CONF_LANG, default=DEFAULT_LANG): probatio.In(
+            SUPPORTED_LANGUAGES
         ),
-        vol.Optional(CONF_VOLUME, default=DEFAULT_VOLUME): vol.All(
-            vol.Coerce(int), vol.Range(-100, 100)
+        probatio.Optional(CONF_GENDER, default=DEFAULT_GENDER): probatio.In(GENDERS),
+        probatio.Optional(CONF_TYPE, default=DEFAULT_TYPE): cv.string,
+        probatio.Optional(CONF_RATE, default=DEFAULT_RATE): probatio.All(
+            probatio.Coerce(int), probatio.Range(-100, 100)
         ),
-        vol.Optional(CONF_PITCH, default=DEFAULT_PITCH): cv.string,
-        vol.Optional(CONF_CONTOUR, default=DEFAULT_CONTOUR): cv.string,
-        vol.Optional(CONF_REGION, default=DEFAULT_REGION): cv.string,
+        probatio.Optional(CONF_VOLUME, default=DEFAULT_VOLUME): probatio.All(
+            probatio.Coerce(int), probatio.Range(-100, 100)
+        ),
+        probatio.Optional(CONF_PITCH, default=DEFAULT_PITCH): cv.string,
+        probatio.Optional(CONF_CONTOUR, default=DEFAULT_CONTOUR): cv.string,
+        probatio.Optional(CONF_REGION, default=DEFAULT_REGION): cv.string,
     }
 )
 
@@ -122,24 +94,44 @@ class MicrosoftProvider(Provider):
         self._gender = gender
         self._type = ttype
         self._output = DEFAULT_OUTPUT
-        self._rate = f"{rate}{UNIT_PERCENTAGE}"
-        self._volume = f"{volume}{UNIT_PERCENTAGE}"
+        self._rate = f"{rate}{PERCENTAGE}"
+        self._volume = f"{volume}{PERCENTAGE}"
         self._pitch = pitch
         self._contour = contour
         self._region = region
         self.name = "Microsoft"
 
     @property
-    def default_language(self):
+    @override
+    def default_language(self) -> str:
         """Return the default language."""
         return self._lang
 
     @property
-    def supported_languages(self):
+    @override
+    def supported_languages(self) -> list[str]:
         """Return list of supported languages."""
-        return SUPPORTED_LANGUAGES
+        return list(SUPPORTED_LANGUAGES)
 
-    def get_tts_audio(self, message, language, options=None):
+    @property
+    @override
+    def supported_options(self) -> list[str]:
+        """Return list of supported options like voice, emotion."""
+        return [MicrosoftTextToSpeechOption.GENDER, MicrosoftTextToSpeechOption.TYPE]
+
+    @property
+    @override
+    def default_options(self) -> dict[str, Any]:
+        """Return a dict include default options."""
+        return {
+            MicrosoftTextToSpeechOption.GENDER: self._gender,
+            MicrosoftTextToSpeechOption.TYPE: self._type,
+        }
+
+    @override
+    def get_tts_audio(
+        self, message: str, language: str, options: dict[str, Any]
+    ) -> TtsAudioType:
         """Load TTS from Microsoft."""
         if language is None:
             language = self._lang
@@ -148,8 +140,8 @@ class MicrosoftProvider(Provider):
             trans = pycsspeechtts.TTSTranslator(self._apikey, self._region)
             data = trans.speak(
                 language=language,
-                gender=self._gender,
-                voiceType=self._type,
+                gender=options[MicrosoftTextToSpeechOption.GENDER],
+                voiceType=options[MicrosoftTextToSpeechOption.TYPE],
                 output=self._output,
                 rate=self._rate,
                 volume=self._volume,
@@ -157,7 +149,7 @@ class MicrosoftProvider(Provider):
                 contour=self._contour,
                 text=message,
             )
-        except HTTPException as ex:
+        except HTTPError as ex:
             _LOGGER.error("Error occurred for Microsoft TTS: %s", ex)
             return (None, None)
         return ("mp3", data)

@@ -1,6 +1,12 @@
 set_run_state:
-  description: Set the ZoneMinder run state
   fields:
+    id:
+      required: true
+      example: "zm.example.com"
+      selector:
+        text:
     name:
-      description: The string name of the ZoneMinder run state to set as active.
-      example: 'Home'
+      required: true
+      example: "Home"
+      selector:
+        text:

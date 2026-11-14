@@ -1,19 +1,14 @@
 """Reproduce an Switch state."""
+
 import asyncio
+from collections.abc import Iterable
 import logging
-from typing import Iterable, Optional
+from typing import Any
 
-from homeassistant.const import (
-    ATTR_ENTITY_ID,
-    SERVICE_TURN_OFF,
-    SERVICE_TURN_ON,
-    STATE_OFF,
-    STATE_ON,
-)
-from homeassistant.core import Context, State
-from homeassistant.helpers.typing import HomeAssistantType
+from homeassistant.const import ATTR_ENTITY_ID, STATE_OFF, STATE_ON
+from homeassistant.core import Context, HomeAssistant, State
 
-from . import DOMAIN
+from .const import DOMAIN, SwitchService
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -21,12 +16,14 @@ VALID_STATES = {STATE_ON, STATE_OFF}
 
 
 async def _async_reproduce_state(
-    hass: HomeAssistantType, state: State, context: Optional[Context] = None
+    hass: HomeAssistant,
+    state: State,
+    *,
+    context: Context | None = None,
+    reproduce_options: dict[str, Any] | None = None,
 ) -> None:
     """Reproduce a single state."""
-    cur_state = hass.states.get(state.entity_id)
-
-    if cur_state is None:
+    if (cur_state := hass.states.get(state.entity_id)) is None:
         _LOGGER.warning("Unable to find entity %s", state.entity_id)
         return
 
@@ -43,9 +40,9 @@ async def _async_reproduce_state(
     service_data = {ATTR_ENTITY_ID: state.entity_id}
 
     if state.state == STATE_ON:
-        service = SERVICE_TURN_ON
+        service = SwitchService.TURN_ON
     elif state.state == STATE_OFF:
-        service = SERVICE_TURN_OFF
+        service = SwitchService.TURN_OFF
 
     await hass.services.async_call(
         DOMAIN, service, service_data, context=context, blocking=True
@@ -53,9 +50,18 @@ async def _async_reproduce_state(
 
 
 async def async_reproduce_states(
-    hass: HomeAssistantType, states: Iterable[State], context: Optional[Context] = None
+    hass: HomeAssistant,
+    states: Iterable[State],
+    *,
+    context: Context | None = None,
+    reproduce_options: dict[str, Any] | None = None,
 ) -> None:
     """Reproduce Switch states."""
     await asyncio.gather(
-        *(_async_reproduce_state(hass, state, context) for state in states)
+        *(
+            _async_reproduce_state(
+                hass, state, context=context, reproduce_options=reproduce_options
+            )
+            for state in states
+        )
     )

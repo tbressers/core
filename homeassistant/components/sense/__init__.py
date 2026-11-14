@@ -1,159 +1,142 @@
 """Support for monitoring a Sense energy sensor."""
-import asyncio
-from datetime import timedelta
-import logging
+
+from dataclasses import dataclass
+from functools import partial
 
 from sense_energy import (
     ASyncSenseable,
-    SenseAPITimeoutException,
+    SenseAPIException,
     SenseAuthenticationException,
+    SenseMFARequiredException,
 )
-import voluptuous as vol
 
-from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
-from homeassistant.const import CONF_EMAIL, CONF_PASSWORD, CONF_TIMEOUT
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_TIMEOUT, Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.dispatcher import async_dispatcher_send
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import (
     ACTIVE_UPDATE_RATE,
-    DEFAULT_TIMEOUT,
     DOMAIN,
-    SENSE_DATA,
-    SENSE_DEVICE_UPDATE,
-    SENSE_DEVICES_DATA,
-    SENSE_DISCOVERED_DEVICES_DATA,
+    SENSE_CONNECT_EXCEPTIONS,
+    SENSE_TIMEOUT_EXCEPTIONS,
+    SENSE_WEBSOCKET_EXCEPTIONS,
 )
+from .coordinator import SenseRealtimeCoordinator, SenseTrendCoordinator
 
-_LOGGER = logging.getLogger(__name__)
-
-PLATFORMS = ["binary_sensor", "sensor"]
-
-CONFIG_SCHEMA = vol.Schema(
-    {
-        DOMAIN: vol.Schema(
-            {
-                vol.Required(CONF_EMAIL): cv.string,
-                vol.Required(CONF_PASSWORD): cv.string,
-                vol.Optional(CONF_TIMEOUT, default=DEFAULT_TIMEOUT): cv.positive_int,
-            }
-        )
-    },
-    extra=vol.ALLOW_EXTRA,
-)
+PLATFORMS = [Platform.BINARY_SENSOR, Platform.SENSOR]
+type SenseConfigEntry = ConfigEntry[SenseData]
 
 
-class SenseDevicesData:
-    """Data for each sense device."""
+@dataclass(kw_only=True, slots=True)
+class SenseData:
+    """Sense data type."""
 
-    def __init__(self):
-        """Create."""
-        self._data_by_device = {}
-
-    def set_devices_data(self, devices):
-        """Store a device update."""
-        self._data_by_device = {}
-        for device in devices:
-            self._data_by_device[device["id"]] = device
-
-    def get_device_by_id(self, sense_device_id):
-        """Get the latest device data."""
-        return self._data_by_device.get(sense_device_id)
+    data: ASyncSenseable
+    trends: SenseTrendCoordinator
+    rt: SenseRealtimeCoordinator
 
 
-async def async_setup(hass: HomeAssistant, config: dict):
-    """Set up the Sense component."""
-    hass.data.setdefault(DOMAIN, {})
-    conf = config.get(DOMAIN)
-    if not conf:
-        return True
-
-    hass.async_create_task(
-        hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={"source": SOURCE_IMPORT},
-            data={
-                CONF_EMAIL: conf[CONF_EMAIL],
-                CONF_PASSWORD: conf[CONF_PASSWORD],
-                CONF_TIMEOUT: conf[CONF_TIMEOUT],
-            },
-        )
-    )
-    return True
-
-
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
+async def async_setup_entry(hass: HomeAssistant, entry: SenseConfigEntry) -> None:
     """Set up Sense from a config entry."""
 
     entry_data = entry.data
-    email = entry_data[CONF_EMAIL]
-    password = entry_data[CONF_PASSWORD]
     timeout = entry_data[CONF_TIMEOUT]
 
-    gateway = ASyncSenseable(api_timeout=timeout, wss_timeout=timeout)
+    access_token = entry_data.get("access_token", "")
+    user_id = entry_data.get("user_id", "")
+    device_id = entry_data.get("device_id", "")
+    refresh_token = entry_data.get("refresh_token", "")
+    monitor_id = entry_data.get("monitor_id", "")
+
+    client_session = async_get_clientsession(hass)
+
+    # Creating the AsyncSenseable object loads
+    # ssl certificates which does blocking IO
+    gateway = await hass.async_add_executor_job(
+        partial(
+            ASyncSenseable,
+            api_timeout=timeout,
+            wss_timeout=timeout,
+            client_session=client_session,
+        )
+    )
     gateway.rate_limit = ACTIVE_UPDATE_RATE
 
     try:
-        await gateway.authenticate(email, password)
-    except SenseAuthenticationException:
-        _LOGGER.error("Could not authenticate with sense server")
-        return False
-    except SenseAPITimeoutException:
-        raise ConfigEntryNotReady
+        gateway.load_auth(access_token, user_id, device_id, refresh_token)
+        gateway.set_monitor_id(monitor_id)
+        await gateway.get_monitor_data()
+    except (SenseAuthenticationException, SenseMFARequiredException) as err:
+        raise ConfigEntryAuthFailed(err) from err
+    except SENSE_TIMEOUT_EXCEPTIONS as err:
+        raise ConfigEntryNotReady(
+            str(err) or "Timed out during authentication"
+        ) from err
+    except SENSE_CONNECT_EXCEPTIONS as err:
+        raise ConfigEntryNotReady(str(err)) from err
 
-    sense_devices_data = SenseDevicesData()
-    sense_discovered_devices = await gateway.get_discovered_device_data()
+    try:
+        await gateway.fetch_devices()
+        await gateway.update_realtime()
+    except SENSE_TIMEOUT_EXCEPTIONS as err:
+        raise ConfigEntryNotReady(
+            str(err) or "Timed out during realtime update"
+        ) from err
+    except SENSE_WEBSOCKET_EXCEPTIONS as err:
+        raise ConfigEntryNotReady(str(err) or "Error during realtime update") from err
+    except SenseAPIException as err:
+        raise ConfigEntryNotReady(
+            str(err) or "API error retrieving realtime data"
+        ) from err
+    except SenseAuthenticationException as err:
+        # We just authenticated, sense_energy also raises this for a 404 while
+        # the monitor is reconnecting
+        raise ConfigEntryNotReady(
+            str(err) or "Monitor not available for realtime data"
+        ) from err
 
-    hass.data[DOMAIN][entry.entry_id] = {
-        SENSE_DATA: gateway,
-        SENSE_DEVICES_DATA: sense_devices_data,
-        SENSE_DISCOVERED_DEVICES_DATA: sense_discovered_devices,
-    }
+    trends_coordinator = SenseTrendCoordinator(hass, entry, gateway)
+    realtime_coordinator = SenseRealtimeCoordinator(hass, entry, gateway)
 
-    for component in PLATFORMS:
-        hass.async_create_task(
-            hass.config_entries.async_forward_entry_setup(entry, component)
-        )
-
-    async def async_sense_update(now):
-        """Retrieve latest state."""
-        try:
-            await gateway.update_realtime()
-        except SenseAPITimeoutException:
-            _LOGGER.error("Timeout retrieving data")
-
-        data = gateway.get_realtime()
-        if "devices" in data:
-            sense_devices_data.set_devices_data(data["devices"])
-        async_dispatcher_send(hass, f"{SENSE_DEVICE_UPDATE}-{gateway.sense_monitor_id}")
-
-    hass.data[DOMAIN][entry.entry_id][
-        "track_time_remove_callback"
-    ] = async_track_time_interval(
-        hass, async_sense_update, timedelta(seconds=ACTIVE_UPDATE_RATE)
+    # This can take longer than 60s and we already know
+    # sense is online since get_discovered_device_data was
+    # successful so we do it later.
+    entry.async_create_background_task(
+        hass,
+        trends_coordinator.async_request_refresh(),
+        "sense.trends-coordinator-refresh",
     )
-    return True
+    entry.async_create_background_task(
+        hass,
+        realtime_coordinator.async_request_refresh(),
+        "sense.realtime-coordinator-refresh",
+    )
+
+    entry.runtime_data = SenseData(
+        data=gateway,
+        trends=trends_coordinator,
+        rt=realtime_coordinator,
+    )
+
+    # Register the monitor device up front so child devices can reference it via
+    # via_device_id; child entities are added by concurrently-loaded platforms
+    # before any of them registers the monitor device.
+    sense_monitor_id = gateway.sense_monitor_id
+    dr.async_get(hass).async_get_or_create(
+        config_entry_id=entry.entry_id,
+        name=f"Sense {sense_monitor_id}",
+        identifiers={(DOMAIN, sense_monitor_id)},
+        model="Sense",
+        manufacturer="Sense Labs, Inc.",
+        configuration_url="https://home.sense.com",
+    )
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
+async def async_unload_entry(hass: HomeAssistant, entry: SenseConfigEntry) -> None:
     """Unload a config entry."""
-    unload_ok = all(
-        await asyncio.gather(
-            *[
-                hass.config_entries.async_forward_entry_unload(entry, component)
-                for component in PLATFORMS
-            ]
-        )
-    )
-    track_time_remove_callback = hass.data[DOMAIN][entry.entry_id][
-        "track_time_remove_callback"
-    ]
-    track_time_remove_callback()
-
-    if unload_ok:
-        hass.data[DOMAIN].pop(entry.entry_id)
-
-    return unload_ok
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)

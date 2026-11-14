@@ -1,203 +1,405 @@
-"""Support for the Netatmo binary sensors."""
+"""Support for Netatmo binary sensors."""
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from functools import partial
 import logging
+from typing import Any, Final, cast, override
 
-import pyatmo
+from pyatmo.modules.device_types import DeviceCategory as NetatmoDeviceCategory
 
-from homeassistant.components.binary_sensor import BinarySensorDevice
+from homeassistant.components.binary_sensor import (
+    BinarySensorDeviceClass,
+    BinarySensorEntity,
+    BinarySensorEntityDescription,
+)
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .camera import CameraData
-from .const import AUTH, DOMAIN, MANUFACTURER
+from .const import (
+    CONF_URL_SECURITY,
+    DOORTAG_CATEGORY_DOOR,
+    DOORTAG_CATEGORY_FURNITURE,
+    DOORTAG_CATEGORY_GARAGE,
+    DOORTAG_CATEGORY_GATE,
+    DOORTAG_CATEGORY_OTHER,
+    DOORTAG_CATEGORY_WINDOW,
+    DOORTAG_STATUS_CALIBRATING,
+    DOORTAG_STATUS_CALIBRATION_FAILED,
+    DOORTAG_STATUS_CLOSED,
+    DOORTAG_STATUS_MAINTENANCE,
+    DOORTAG_STATUS_NO_NEWS,
+    DOORTAG_STATUS_OPEN,
+    DOORTAG_STATUS_UNDEFINED,
+    DOORTAG_STATUS_WEAK_SIGNAL,
+    NETATMO_CREATE_CONNECTIVITY_BINARY_SENSOR,
+    NETATMO_CREATE_OPENING_BINARY_SENSOR,
+    NETATMO_CREATE_WEATHER_BINARY_SENSOR,
+)
+from .coordinator import SIGNAL_NAME, NetatmoConfigEntry, NetatmoDevice
+from .entity import NetatmoModuleEntity, NetatmoWeatherModuleEntity
 
 _LOGGER = logging.getLogger(__name__)
 
-# These are the available sensors mapped to binary_sensor class
-WELCOME_SENSOR_TYPES = {
-    "Someone known": "motion",
-    "Someone unknown": "motion",
-    "Motion": "motion",
-}
-PRESENCE_SENSOR_TYPES = {
-    "Outdoor motion": "motion",
-    "Outdoor human": "motion",
-    "Outdoor animal": "motion",
-    "Outdoor vehicle": "motion",
-}
-TAG_SENSOR_TYPES = {"Tag Vibration": "vibration", "Tag Open": "opening"}
+PARALLEL_UPDATES = 0
 
-SENSOR_TYPES = {
-    "NACamera": WELCOME_SENSOR_TYPES,
-    "NOC": PRESENCE_SENSOR_TYPES,
+DEFAULT_OPENING_SENSOR_KEY = "opening_sensor"
+
+OPENING_STATUS_TO_BINARY_SENSOR_STATE: Final[dict[str, bool | None]] = {
+    DOORTAG_STATUS_NO_NEWS: None,
+    DOORTAG_STATUS_CALIBRATING: None,
+    DOORTAG_STATUS_UNDEFINED: None,
+    DOORTAG_STATUS_CLOSED: False,
+    DOORTAG_STATUS_OPEN: True,
+    DOORTAG_STATUS_CALIBRATION_FAILED: None,
+    DOORTAG_STATUS_MAINTENANCE: None,
+    DOORTAG_STATUS_WEAK_SIGNAL: None,
 }
 
-CONF_HOME = "home"
-CONF_CAMERAS = "cameras"
-CONF_WELCOME_SENSORS = "welcome_sensors"
-CONF_PRESENCE_SENSORS = "presence_sensors"
-CONF_TAG_SENSORS = "tag_sensors"
 
-DEFAULT_TIMEOUT = 90
+OPENING_CATEGORY_TO_DEVICE_CLASS: Final[dict[str | None, BinarySensorDeviceClass]] = {
+    DOORTAG_CATEGORY_DOOR: BinarySensorDeviceClass.DOOR,
+    DOORTAG_CATEGORY_FURNITURE: BinarySensorDeviceClass.OPENING,
+    DOORTAG_CATEGORY_GARAGE: BinarySensorDeviceClass.GARAGE_DOOR,
+    DOORTAG_CATEGORY_GATE: BinarySensorDeviceClass.OPENING,
+    DOORTAG_CATEGORY_OTHER: BinarySensorDeviceClass.OPENING,
+    DOORTAG_CATEGORY_WINDOW: BinarySensorDeviceClass.WINDOW,
+}
 
 
-async def async_setup_entry(hass, entry, async_add_entities):
-    """Set up the access to Netatmo binary sensor."""
-    auth = hass.data[DOMAIN][entry.entry_id][AUTH]
+def get_opening_category(netatmo_device: NetatmoDevice) -> str:
+    """Helper function to get opening category for doortag."""
 
-    def get_entities():
-        """Retrieve Netatmo entities."""
-        entities = []
+    return (
+        getattr(netatmo_device.device, "doortag_category", None)
+        or DOORTAG_CATEGORY_OTHER
+    )
 
-        def get_camera_home_id(data, camera_id):
-            """Return the home id for a given camera id."""
-            for home_id in data.camera_data.cameras:
-                for camera in data.camera_data.cameras[home_id].values():
-                    if camera["id"] == camera_id:
-                        return home_id
-            return None
 
-        try:
-            data = CameraData(hass, auth)
+OPENING_CATEGORY_TO_KEY: Final[dict[str, str | None]] = {
+    DOORTAG_CATEGORY_DOOR: None,
+    DOORTAG_CATEGORY_FURNITURE: DOORTAG_CATEGORY_FURNITURE,
+    DOORTAG_CATEGORY_GARAGE: None,
+    DOORTAG_CATEGORY_GATE: DOORTAG_CATEGORY_GATE,
+    DOORTAG_CATEGORY_OTHER: DEFAULT_OPENING_SENSOR_KEY,
+    DOORTAG_CATEGORY_WINDOW: None,
+}
 
-            for camera in data.get_all_cameras():
-                home_id = get_camera_home_id(data, camera_id=camera["id"])
 
-                sensor_types = {}
-                sensor_types.update(SENSOR_TYPES[camera["type"]])
+@dataclass(frozen=True, kw_only=True)
+class NetatmoBinarySensorEntityDescription(BinarySensorEntityDescription):
+    """Describes Netatmo binary sensor entity."""
 
-                # Tags are only supported with Netatmo Welcome indoor cameras
-                modules = data.get_modules(camera["id"])
-                if camera["type"] == "NACamera" and modules:
-                    for module in modules:
-                        for sensor_type in TAG_SENSOR_TYPES:
-                            _LOGGER.debug(
-                                "Adding camera tag %s (%s)",
-                                module["name"],
-                                module["id"],
-                            )
-                            entities.append(
-                                NetatmoBinarySensor(
-                                    data,
-                                    camera["id"],
-                                    home_id,
-                                    sensor_type,
-                                    module["id"],
-                                )
-                            )
+    # The name used by Netatmo API for this sensor
+    # (exposed feature as attribute) if different than key
+    netatmo_name: str | None = None
+    value_fn: Callable[[str], str | bool | None] = lambda x: x
 
-                for sensor_type in sensor_types:
-                    entities.append(
-                        NetatmoBinarySensor(data, camera["id"], home_id, sensor_type)
+
+NETATMO_CONNECTIVITY_BINARY_SENSOR_DESCRIPTIONS: Final[
+    list[NetatmoBinarySensorEntityDescription]
+] = [
+    NetatmoBinarySensorEntityDescription(
+        key="reachable",
+        device_class=BinarySensorDeviceClass.CONNECTIVITY,
+    ),
+]
+
+# Assuming a Module object with the following attributes:
+# {'battery_level': 5780,
+#  'battery_percent': None,
+#  'battery_state': 'full',
+#  'bridge': 'XX:XX:XX:XX:XX:XX',
+#  'device_category': <DeviceCategory.opening: 'opening'>,
+#  'device_type': <DeviceType.NACamDoorTag: 'NACamDoorTag'>,
+#  'entity_id': 'NN:NN:NN:NN:NN:NN',
+#  'features': {'status', 'battery', 'rf_strength', 'reachable'},
+#  'firmware_name': None,
+#  'firmware_revision': 58,
+#  'history_features': set(),
+#  'history_features_values': {},
+#  'home': <pyatmo.home.Home object at 0x790e5c3ea660>,
+#  'modules': None,
+#  'name': 'YYYYYY',
+#  'reachable': True,
+#  'rf_strength': 74,
+#  'room_id': 'ZZZZZZZZ',
+#  'status': 'open'}
+
+NETATMO_OPENING_BINARY_SENSOR_DESCRIPTIONS: Final[
+    list[NetatmoBinarySensorEntityDescription]
+] = [
+    NetatmoBinarySensorEntityDescription(
+        key="opening",
+        netatmo_name="status",
+        value_fn=OPENING_STATUS_TO_BINARY_SENSOR_STATE.get,
+    ),
+]
+
+DEVICE_CATEGORY_BINARY_URLS: Final[dict[NetatmoDeviceCategory, str]] = {
+    NetatmoDeviceCategory.opening: CONF_URL_SECURITY,
+}
+
+DEVICE_CATEGORY_WEATHER_BINARY_SENSORS: Final[
+    dict[NetatmoDeviceCategory, list[NetatmoBinarySensorEntityDescription]]
+] = {
+    NetatmoDeviceCategory.air_care: NETATMO_CONNECTIVITY_BINARY_SENSOR_DESCRIPTIONS,
+    NetatmoDeviceCategory.weather: NETATMO_CONNECTIVITY_BINARY_SENSOR_DESCRIPTIONS,
+}
+
+DEVICE_CATEGORY_CONNECTIVITY_BINARY_SENSORS: Final[
+    dict[NetatmoDeviceCategory, list[NetatmoBinarySensorEntityDescription]]
+] = {
+    NetatmoDeviceCategory.opening: NETATMO_CONNECTIVITY_BINARY_SENSOR_DESCRIPTIONS,
+}
+
+DEVICE_CATEGORY_OPENING_BINARY_SENSORS: Final[
+    dict[NetatmoDeviceCategory, list[NetatmoBinarySensorEntityDescription]]
+] = {
+    NetatmoDeviceCategory.opening: NETATMO_OPENING_BINARY_SENSOR_DESCRIPTIONS,
+}
+
+DEVICE_CATEGORY_BINARY_PUBLISHERS: Final[list[NetatmoDeviceCategory]] = [
+    NetatmoDeviceCategory.opening,
+]
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: NetatmoConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up Netatmo weather binary sensors based on a config entry."""
+
+    @callback
+    def _create_binary_sensor_entity(
+        binarySensorClass: type[
+            NetatmoWeatherBinarySensor
+            | NetatmoOpeningBinarySensor
+            | NetatmoConnectivityBinarySensor
+        ],
+        descriptions: dict[
+            NetatmoDeviceCategory, list[NetatmoBinarySensorEntityDescription]
+        ],
+        netatmo_device: NetatmoDevice,
+    ) -> None:
+        """Create binary sensor entities for a Netatmo device."""
+
+        if netatmo_device.device.device_category is None:
+            return
+
+        descriptions_to_add = descriptions.get(
+            netatmo_device.device.device_category, []
+        )
+
+        entities: list[
+            NetatmoWeatherBinarySensor
+            | NetatmoOpeningBinarySensor
+            | NetatmoConnectivityBinarySensor
+        ] = []
+
+        # Create binary sensors for module
+        for description in descriptions_to_add:
+            if description.netatmo_name is None:
+                feature_check = description.key
+            else:
+                feature_check = description.netatmo_name
+            if feature_check in netatmo_device.device.features:
+                _LOGGER.debug(
+                    'Adding "%s" (native: "%s") binary sensor for device %s',
+                    description.key,
+                    feature_check,
+                    netatmo_device.device.name,
+                )
+                entities.append(
+                    binarySensorClass(
+                        netatmo_device,
+                        description,
                     )
-        except pyatmo.NoDevice:
-            _LOGGER.debug("No camera entities to add")
+                )
 
-        return entities
+        if entities:
+            async_add_entities(entities)
 
-    async_add_entities(await hass.async_add_executor_job(get_entities), True)
+    entry.async_on_unload(
+        async_dispatcher_connect(
+            hass,
+            NETATMO_CREATE_WEATHER_BINARY_SENSOR,
+            partial(
+                _create_binary_sensor_entity,
+                NetatmoWeatherBinarySensor,
+                DEVICE_CATEGORY_WEATHER_BINARY_SENSORS,
+            ),
+        )
+    )
+
+    entry.async_on_unload(
+        async_dispatcher_connect(
+            hass,
+            NETATMO_CREATE_OPENING_BINARY_SENSOR,
+            partial(
+                _create_binary_sensor_entity,
+                NetatmoOpeningBinarySensor,
+                DEVICE_CATEGORY_OPENING_BINARY_SENSORS,
+            ),
+        )
+    )
+
+    entry.async_on_unload(
+        async_dispatcher_connect(
+            hass,
+            NETATMO_CREATE_CONNECTIVITY_BINARY_SENSOR,
+            partial(
+                _create_binary_sensor_entity,
+                NetatmoConnectivityBinarySensor,
+                DEVICE_CATEGORY_CONNECTIVITY_BINARY_SENSORS,
+            ),
+        )
+    )
 
 
-class NetatmoBinarySensor(BinarySensorDevice):
-    """Represent a single binary sensor in a Netatmo Camera device."""
+class NetatmoBinarySensor(NetatmoModuleEntity, BinarySensorEntity):
+    """Implementation of a Netatmo binary sensor."""
 
-    def __init__(self, data, camera_id, home_id, sensor_type, module_id=None):
-        """Set up for access to the Netatmo camera events."""
-        self._data = data
-        self._camera_id = camera_id
-        self._module_id = module_id
-        self._sensor_type = sensor_type
-        camera_info = data.camera_data.cameraById(cid=camera_id)
-        self._camera_name = camera_info["name"]
-        self._camera_type = camera_info["type"]
-        self._home_id = home_id
-        self._home_name = self._data.camera_data.getHomeName(home_id=home_id)
-        self._timeout = DEFAULT_TIMEOUT
-        if module_id:
-            self._module_name = data.camera_data.moduleById(mid=module_id)["name"]
-            self._name = (
-                f"{MANUFACTURER} {self._camera_name} {self._module_name} {sensor_type}"
+    entity_description: NetatmoBinarySensorEntityDescription
+    _attr_has_entity_name = True
+
+    def __init__(
+        self,
+        netatmo_device: NetatmoDevice,
+        description: NetatmoBinarySensorEntityDescription,
+        **kwargs: Any,  # Add this to capture extra args from super()
+    ) -> None:
+        """Initialize a Netatmo binary sensor."""
+
+        # To prevent exception about missing URL we need to set it explicitly
+        if netatmo_device.device.device_category is not None:
+            if (
+                DEVICE_CATEGORY_BINARY_URLS.get(netatmo_device.device.device_category)
+                is not None
+            ):
+                self._attr_configuration_url = DEVICE_CATEGORY_BINARY_URLS[
+                    netatmo_device.device.device_category
+                ]
+
+        super().__init__(netatmo_device, **kwargs)
+
+        self.entity_description = description
+        self._attr_unique_id = f"{self.device.entity_id}-{description.key}"
+
+        # Register publishers for the entity if needed
+        # (not already done in parent class - weather and
+        # air_care). We need to keep this here because we have
+        # two classes depending on it and we want to avoid
+        # adding publishers for all binary sensors
+        if self.device.device_category in DEVICE_CATEGORY_BINARY_PUBLISHERS:
+            self._publishers.extend(
+                [
+                    {
+                        "name": self.home.entity_id,
+                        "home_id": self.home.entity_id,
+                        SIGNAL_NAME: netatmo_device.signal_name,
+                    },
+                ]
             )
-            self._unique_id = (
-                f"{self._camera_id}-{self._module_id}-"
-                f"{self._camera_type}-{sensor_type}"
-            )
+
+    @callback
+    @override
+    def async_update_callback(self) -> None:
+        """Update the entity's state."""
+
+        # Should be the connectivity (reachable) sensor only
+        # here as we have update for opening in its class
+
+        # Setting reachable sensor, so we just get it directly
+        # (backward compatibility to weather binary sensor)
+        value = getattr(self.device, self.entity_description.key, None)
+
+        if value is None:
+            self._attr_available = False
+            self._attr_is_on = False
         else:
-            self._name = f"{MANUFACTURER} {self._camera_name} {sensor_type}"
-            self._unique_id = f"{self._camera_id}-{self._camera_type}-{sensor_type}"
-        self._state = None
+            self._attr_available = True
+            self._attr_is_on = cast(bool, value)
+        self.async_write_ha_state()
 
-    @property
-    def name(self):
-        """Return the name of the Netatmo device and this sensor."""
-        return self._name
 
-    @property
-    def unique_id(self):
-        """Return the unique ID for this sensor."""
-        return self._unique_id
+class NetatmoWeatherBinarySensor(NetatmoWeatherModuleEntity, NetatmoBinarySensor):
+    """Implementation of a Netatmo weather binary sensor."""
 
-    @property
-    def device_class(self):
-        """Return the class of this sensor."""
-        if self._camera_type == "NACamera":
-            return WELCOME_SENSOR_TYPES.get(self._sensor_type)
-        if self._camera_type == "NOC":
-            return PRESENCE_SENSOR_TYPES.get(self._sensor_type)
-        return TAG_SENSOR_TYPES.get(self._sensor_type)
+    entity_description: NetatmoBinarySensorEntityDescription
 
-    @property
-    def device_info(self):
-        """Return the device info for the sensor."""
-        return {
-            "identifiers": {(DOMAIN, self._camera_id)},
-            "name": self._camera_name,
-            "manufacturer": MANUFACTURER,
-            "model": self._camera_type,
-        }
+    def __init__(
+        self,
+        netatmo_device: NetatmoDevice,
+        description: NetatmoBinarySensorEntityDescription,
+    ) -> None:
+        """Initialize a Netatmo weather binary sensor."""
 
-    @property
-    def is_on(self):
-        """Return true if binary sensor is on."""
-        return self._state
+        super().__init__(netatmo_device, description=description)
 
-    def update(self):
-        """Request an update from the Netatmo API."""
-        self._data.update()
-        self._data.update_event(camera_type=self._camera_type)
 
-        if self._camera_type == "NACamera":
-            if self._sensor_type == "Someone known":
-                self._state = self._data.camera_data.someone_known_seen(
-                    cid=self._camera_id, exclude=self._timeout
+class NetatmoOpeningBinarySensor(NetatmoBinarySensor):
+    """Implementation of a Netatmo opening binary sensor."""
+
+    entity_description: NetatmoBinarySensorEntityDescription
+    _attr_has_entity_name = True
+
+    def __init__(
+        self,
+        netatmo_device: NetatmoDevice,
+        description: NetatmoBinarySensorEntityDescription,
+    ) -> None:
+        """Initialize a Netatmo binary sensor."""
+
+        super().__init__(netatmo_device, description)
+
+        # Apply Dynamic Device Class override
+        self._attr_device_class = OPENING_CATEGORY_TO_DEVICE_CLASS.get(
+            get_opening_category(netatmo_device), BinarySensorDeviceClass.OPENING
+        )
+
+        # Apply Dynamic Translation Key override if needed
+        translation_key = OPENING_CATEGORY_TO_KEY.get(
+            get_opening_category(netatmo_device), DEFAULT_OPENING_SENSOR_KEY
+        )
+        if translation_key is not None:
+            self._attr_translation_key = translation_key
+
+    @callback
+    @override
+    def async_update_callback(self) -> None:
+        """Update the entity's state."""
+
+        if not self.device.reachable:
+            # If reachable is None or False we set availability to False
+            self._attr_available = False
+            self._attr_is_on = None
+
+        else:
+            # If reachable is True, we get the actual value
+            if self.entity_description.netatmo_name is None:
+                raw_value = getattr(self.device, self.entity_description.key, None)
+            else:
+                raw_value = getattr(
+                    self.device, self.entity_description.netatmo_name, None
                 )
-            elif self._sensor_type == "Someone unknown":
-                self._state = self._data.camera_data.someone_unknown_seen(
-                    cid=self._camera_id, exclude=self._timeout
-                )
-            elif self._sensor_type == "Motion":
-                self._state = self._data.camera_data.motion_detected(
-                    cid=self._camera_id, exclude=self._timeout
-                )
-        elif self._camera_type == "NOC":
-            if self._sensor_type == "Outdoor motion":
-                self._state = self._data.camera_data.outdoor_motion_detected(
-                    cid=self._camera_id, offset=self._timeout
-                )
-            elif self._sensor_type == "Outdoor human":
-                self._state = self._data.camera_data.human_detected(
-                    cid=self._camera_id, offset=self._timeout
-                )
-            elif self._sensor_type == "Outdoor animal":
-                self._state = self._data.camera_data.animal_detected(
-                    cid=self._camera_id, offset=self._timeout
-                )
-            elif self._sensor_type == "Outdoor vehicle":
-                self._state = self._data.camera_data.car_detected(
-                    cid=self._camera_id, offset=self._timeout
-                )
-        if self._sensor_type == "Tag Vibration":
-            self._state = self._data.camera_data.module_motion_detected(
-                mid=self._module_id, cid=self._camera_id, exclude=self._timeout
-            )
-        elif self._sensor_type == "Tag Open":
-            self._state = self._data.camera_data.module_opened(
-                mid=self._module_id, cid=self._camera_id, exclude=self._timeout
-            )
+
+            if raw_value is not None:
+                value = self.entity_description.value_fn(raw_value)
+            else:
+                value = None
+
+            # Set sensor state
+            self._attr_available = True
+            self._attr_is_on = cast(bool, value) if value is not None else None
+
+        self.async_write_ha_state()
+
+
+class NetatmoConnectivityBinarySensor(NetatmoBinarySensor):
+    """Implementation of a Netatmo connectivity binary sensor."""
+
+    entity_description: NetatmoBinarySensorEntityDescription
+    _attr_has_entity_name = True

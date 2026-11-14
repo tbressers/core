@@ -1,9 +1,14 @@
 {
   "domain": "gios",
-  "name": "GIOŚ",
-  "documentation": "https://www.home-assistant.io/integrations/gios",
-  "dependencies": [],
+  "name": "GIO\u015a",
+  "categories": ["weather_alerts.air_quality_pollen"],
   "codeowners": ["@bieniu"],
-  "requirements": ["gios==0.0.3"],
-  "config_flow": true
+  "config_flow": true,
+  "connectivity": ["cloud"],
+  "documentation": "https://www.home-assistant.io/integrations/gios",
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
+  "loggers": ["dacite", "gios"],
+  "quality_scale": "platinum",
+  "requirements": ["gios==7.1.1"]
 }

@@ -1,34 +1,43 @@
 """Support for Linksys Smart Wifi routers."""
-import logging
 
+from http import HTTPStatus
+import logging
+from typing import override
+
+import probatio
 import requests
-import voluptuous as vol
 
 from homeassistant.components.device_tracker import (
-    DOMAIN,
-    PLATFORM_SCHEMA,
+    DOMAIN as DEVICE_TRACKER_DOMAIN,
+    PLATFORM_SCHEMA as DEVICE_TRACKER_PLATFORM_SCHEMA,
     DeviceScanner,
 )
 from homeassistant.const import CONF_HOST
-import homeassistant.helpers.config_validation as cv
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.typing import ConfigType
 
 DEFAULT_TIMEOUT = 10
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({vol.Required(CONF_HOST): cv.string})
+PLATFORM_SCHEMA = DEVICE_TRACKER_PLATFORM_SCHEMA.extend(
+    {probatio.Required(CONF_HOST): cv.string}
+)
 
 
-def get_scanner(hass, config):
+def get_scanner(
+    hass: HomeAssistant, config: ConfigType
+) -> LinksysSmartWifiDeviceScanner | None:
     """Validate the configuration and return a Linksys AP scanner."""
     try:
-        return LinksysSmartWifiDeviceScanner(config[DOMAIN])
+        return LinksysSmartWifiDeviceScanner(config[DEVICE_TRACKER_DOMAIN])
     except ConnectionError:
         return None
 
 
 class LinksysSmartWifiDeviceScanner(DeviceScanner):
-    """This class queries a Linksys Access Point."""
+    """Class which queries a Linksys Access Point."""
 
     def __init__(self, config):
         """Initialize the scanner."""
@@ -37,26 +46,28 @@ class LinksysSmartWifiDeviceScanner(DeviceScanner):
 
         # Check if the access point is accessible
         response = self._make_request()
-        if not response.status_code == 200:
+        if response.status_code != HTTPStatus.OK:
             raise ConnectionError("Cannot connect to Linksys Access Point")
 
+    @override
     def scan_devices(self):
         """Scan for new devices and return a list with device IDs (MACs)."""
         self._update_info()
 
         return self.last_results.keys()
 
+    @override
     def get_device_name(self, device):
         """Return the name (if known) of the device."""
         return self.last_results.get(device)
 
     def _update_info(self):
         """Check for connected devices."""
-        _LOGGER.info("Checking Linksys Smart Wifi")
+        _LOGGER.debug("Checking Linksys Smart Wifi")
 
         self.last_results = {}
         response = self._make_request()
-        if response.status_code != 200:
+        if response.status_code != HTTPStatus.OK:
             _LOGGER.error(
                 "Got HTTP status code %d when getting device list", response.status_code
             )
@@ -66,13 +77,11 @@ class LinksysSmartWifiDeviceScanner(DeviceScanner):
             result = data["responses"][0]
             devices = result["output"]["devices"]
             for device in devices:
-                macs = device["knownMACAddresses"]
-                if not macs:
+                if not (macs := device["knownMACAddresses"]):
                     _LOGGER.warning("Skipping device without known MAC address")
                     continue
                 mac = macs[-1]
-                connections = device["connections"]
-                if not connections:
+                if not device["connections"]:
                     _LOGGER.debug("Device %s is not connected", mac)
                     continue
 
@@ -85,7 +94,7 @@ class LinksysSmartWifiDeviceScanner(DeviceScanner):
 
                 _LOGGER.debug("Device %s is connected", mac)
                 self.last_results[mac] = name
-        except (KeyError, IndexError):
+        except KeyError, IndexError:
             _LOGGER.exception("Router returned unexpected response")
             return False
         return True

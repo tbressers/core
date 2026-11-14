@@ -1,128 +1,189 @@
 """Notifications for Android TV notification service."""
-import base64
-import io
-import logging
 
+from datetime import timedelta
+from io import BufferedReader
+import logging
+from typing import Any, Final, override
+
+from notifications_android_tv.notifications import ConnectError, Notifications
+import probatio
 import requests
 from requests.auth import HTTPBasicAuth, HTTPDigestAuth
-import voluptuous as vol
 
+from homeassistant.components.media_source import (
+    async_get_media_image,
+    async_resolve_media,
+)
 from homeassistant.components.notify import (
     ATTR_DATA,
     ATTR_TITLE,
     ATTR_TITLE_DEFAULT,
-    PLATFORM_SCHEMA,
     BaseNotificationService,
+    NotifyEntity,
+    NotifyEntityFeature,
 )
-from homeassistant.const import CONF_HOST, CONF_TIMEOUT, UNIT_PERCENTAGE
-import homeassistant.helpers.config_validation as cv
+from homeassistant.const import CONF_HOST
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.os_error import os_read_error
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+
+from . import NFAndroidTVConfigEntry
+from .const import (
+    ATTR_BKGCOLOR,
+    ATTR_COLOR,
+    ATTR_DURATION,
+    ATTR_FONTSIZE,
+    ATTR_ICON_AUTH,
+    ATTR_ICON_AUTH_DIGEST,
+    ATTR_ICON_PASSWORD,
+    ATTR_ICON_PATH,
+    ATTR_ICON_URL,
+    ATTR_ICON_USERNAME,
+    ATTR_IMAGE,
+    ATTR_IMAGE_AUTH,
+    ATTR_IMAGE_AUTH_DIGEST,
+    ATTR_IMAGE_PASSWORD,
+    ATTR_IMAGE_PATH,
+    ATTR_IMAGE_URL,
+    ATTR_IMAGE_USERNAME,
+    ATTR_INTERRUPT,
+    ATTR_POSITION,
+    ATTR_TRANSPARENCY,
+    DEFAULT_TIMEOUT,
+    DOMAIN,
+    NFAndroidTVServiceArgument,
+)
+from .issue import deprecated_notify_action_call
 
 _LOGGER = logging.getLogger(__name__)
 
-CONF_DURATION = "duration"
-CONF_FONTSIZE = "fontsize"
-CONF_POSITION = "position"
-CONF_TRANSPARENCY = "transparency"
-CONF_COLOR = "color"
-CONF_INTERRUPT = "interrupt"
+_ATTR_ICON = "icon"
 
-DEFAULT_DURATION = 5
-DEFAULT_FONTSIZE = "medium"
-DEFAULT_POSITION = "bottom-right"
-DEFAULT_TRANSPARENCY = "default"
-DEFAULT_COLOR = "grey"
-DEFAULT_INTERRUPT = False
-DEFAULT_TIMEOUT = 5
-DEFAULT_ICON = (
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGP6zwAAAgcBApo"
-    "cMXEAAAAASUVORK5CYII="
-)
-
-ATTR_DURATION = "duration"
-ATTR_FONTSIZE = "fontsize"
-ATTR_POSITION = "position"
-ATTR_TRANSPARENCY = "transparency"
-ATTR_COLOR = "color"
-ATTR_BKGCOLOR = "bkgcolor"
-ATTR_INTERRUPT = "interrupt"
-ATTR_IMAGE = "filename2"
-ATTR_FILE = "file"
-# Attributes contained in file
-ATTR_FILE_URL = "url"
-ATTR_FILE_PATH = "path"
-ATTR_FILE_USERNAME = "username"
-ATTR_FILE_PASSWORD = "password"
-ATTR_FILE_AUTH = "auth"
-# Any other value or absence of 'auth' lead to basic authentication being used
-ATTR_FILE_AUTH_DIGEST = "digest"
-
-FONTSIZES = {"small": 1, "medium": 0, "large": 2, "max": 3}
-
-POSITIONS = {
-    "bottom-right": 0,
-    "bottom-left": 1,
-    "top-right": 2,
-    "top-left": 3,
-    "center": 4,
-}
-
-TRANSPARENCIES = {
-    "default": 0,
-    f"0{UNIT_PERCENTAGE}": 1,
-    f"25{UNIT_PERCENTAGE}": 2,
-    f"50{UNIT_PERCENTAGE}": 3,
-    f"75{UNIT_PERCENTAGE}": 4,
-    f"100{UNIT_PERCENTAGE}": 5,
-}
-
-COLORS = {
-    "grey": "#607d8b",
-    "black": "#000000",
-    "indigo": "#303F9F",
-    "green": "#4CAF50",
-    "red": "#F44336",
-    "cyan": "#00BCD4",
-    "teal": "#009688",
-    "amber": "#FFC107",
-    "pink": "#E91E63",
-}
-
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {
-        vol.Required(CONF_HOST): cv.string,
-        vol.Optional(CONF_DURATION, default=DEFAULT_DURATION): vol.Coerce(int),
-        vol.Optional(CONF_FONTSIZE, default=DEFAULT_FONTSIZE): vol.In(FONTSIZES.keys()),
-        vol.Optional(CONF_POSITION, default=DEFAULT_POSITION): vol.In(POSITIONS.keys()),
-        vol.Optional(CONF_TRANSPARENCY, default=DEFAULT_TRANSPARENCY): vol.In(
-            TRANSPARENCIES.keys()
-        ),
-        vol.Optional(CONF_COLOR, default=DEFAULT_COLOR): vol.In(COLORS.keys()),
-        vol.Optional(CONF_TIMEOUT, default=DEFAULT_TIMEOUT): vol.Coerce(int),
-        vol.Optional(CONF_INTERRUPT, default=DEFAULT_INTERRUPT): cv.boolean,
-    }
-)
+_MESSAGE_NEWLINE_TAG: Final = "<br>"
 
 
-def get_service(hass, config, discovery_info=None):
-    """Get the Notifications for Android TV notification service."""
-    remoteip = config.get(CONF_HOST)
-    duration = config.get(CONF_DURATION)
-    fontsize = config.get(CONF_FONTSIZE)
-    position = config.get(CONF_POSITION)
-    transparency = config.get(CONF_TRANSPARENCY)
-    color = config.get(CONF_COLOR)
-    interrupt = config.get(CONF_INTERRUPT)
-    timeout = config.get(CONF_TIMEOUT)
+def nl2br(message: str) -> str:
+    """Replace newlines with _MESSAGE_NEWLINE_TAG tags."""
+    return message.replace("\n", _MESSAGE_NEWLINE_TAG)
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: NFAndroidTVConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up the notify platform."""
+    async_add_entities([NFAndroidTVNotifyEntity(config_entry)])
+
+
+class NFAndroidTVNotifyEntity(NotifyEntity):
+    """Representation of a notify entity."""
+
+    _attr_supported_features = NotifyEntityFeature.TITLE
+    _attr_translation_key = "notify"
+    _attr_has_entity_name = True
+    _attr_name = None
+
+    def __init__(self, entry: NFAndroidTVConfigEntry) -> None:
+        """Initialize the entity."""
+        self._attr_unique_id = entry.entry_id
+        self._attr_device_info = DeviceInfo(
+            entry_type=DeviceEntryType.SERVICE,
+            name=entry.title,
+            model="Notifications",
+            manufacturer="dream apps",
+            identifiers={(DOMAIN, entry.entry_id)},
+        )
+        self.entry = entry
+        self.client = entry.runtime_data
+
+    @override
+    def send_message(self, message: str, title: str | None = None) -> None:
+        """Send a message via notify.send_message action."""
+        try:
+            self.client.send(message=nl2br(message), title=title)
+        except ConnectError as e:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="notify_connection_error",
+                translation_placeholders={"name": self.entry.title},
+            ) from e
+
+    async def nfandroidtv_send_message(self, message: str, **kwargs: Any) -> None:
+        """Send a message via nfandroidtv.send_message."""
+
+        if NFAndroidTVServiceArgument.INTERACTIVE in kwargs:
+            kwargs[ATTR_INTERRUPT] = kwargs.pop(NFAndroidTVServiceArgument.INTERACTIVE)
+        if NFAndroidTVServiceArgument.IMAGE in kwargs:
+            kwargs["image_file"] = await _resolve_media(
+                self.hass, kwargs.pop(NFAndroidTVServiceArgument.IMAGE)
+            )
+        if NFAndroidTVServiceArgument.ICON in kwargs:
+            kwargs[_ATTR_ICON] = await _resolve_media(
+                self.hass, kwargs.pop(NFAndroidTVServiceArgument.ICON)
+            )
+        if NFAndroidTVServiceArgument.DURATION in kwargs:
+            duration: timedelta = kwargs.pop(NFAndroidTVServiceArgument.DURATION)
+            kwargs[ATTR_DURATION] = int(duration.total_seconds())
+        if NFAndroidTVServiceArgument.BACKGROUND_COLOR in kwargs:
+            kwargs[ATTR_BKGCOLOR] = kwargs.pop(
+                NFAndroidTVServiceArgument.BACKGROUND_COLOR
+            )
+
+        try:
+            sent = await self.hass.async_add_executor_job(
+                lambda: self.client.send(message=nl2br(message), **kwargs)
+            )
+        except (ConnectError, requests.RequestException) as e:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="notify_connection_error",
+                translation_placeholders={"name": self.entry.title},
+            ) from e
+        if not sent:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="notify_failed",
+                translation_placeholders={"name": self.entry.title},
+            )
+        self._async_record_notification()
+
+
+async def _resolve_media(hass: HomeAssistant, media_source: dict[str, Any]) -> bytes:
+    """Resolve media from a media source."""
+    media_content_id: str = media_source["media_content_id"]
+
+    if media_image := await async_get_media_image(hass, media_content_id):
+        return media_image.content
+
+    media = await async_resolve_media(hass, media_content_id, None)
+
+    if media.path is None:
+        raise ServiceValidationError(
+            translation_domain=DOMAIN,
+            translation_key="media_source_not_supported",
+        )
+    try:
+        return await hass.async_add_executor_job(media.path.read_bytes)
+    except OSError as err:
+        raise os_read_error(err, str(media.path)) from err
+
+
+async def async_get_service(
+    hass: HomeAssistant,
+    config: ConfigType,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> NFAndroidTVNotificationService | None:
+    """Get the NFAndroidTV notification service."""
+    if discovery_info is None:
+        return None
 
     return NFAndroidTVNotificationService(
-        remoteip,
-        duration,
-        fontsize,
-        position,
-        transparency,
-        color,
-        interrupt,
-        timeout,
+        discovery_info[CONF_HOST],
         hass.config.is_allowed_path,
     )
 
@@ -132,127 +193,171 @@ class NFAndroidTVNotificationService(BaseNotificationService):
 
     def __init__(
         self,
-        remoteip,
-        duration,
-        fontsize,
-        position,
-        transparency,
-        color,
-        interrupt,
-        timeout,
-        is_allowed_path,
-    ):
+        host: str,
+        is_allowed_path: Any,
+    ) -> None:
         """Initialize the service."""
-        self._target = f"http://{remoteip}:7676"
-        self._default_duration = duration
-        self._default_fontsize = fontsize
-        self._default_position = position
-        self._default_transparency = transparency
-        self._default_color = color
-        self._default_interrupt = interrupt
-        self._timeout = timeout
-        self._icon_file = io.BytesIO(base64.b64decode(DEFAULT_ICON))
+        self.host = host
         self.is_allowed_path = is_allowed_path
+        self.notify: Notifications | None = None
 
-    def send_message(self, message="", **kwargs):
-        """Send a message to a Android TV device."""
-        _LOGGER.debug("Sending notification to: %s", self._target)
+    @override
+    def send_message(self, message: str, **kwargs: Any) -> None:
+        """Send a message to an Android TV device."""
+        deprecated_notify_action_call(self.hass, self._service_name)
+        if self.notify is None:
+            try:
+                self.notify = Notifications(self.host)
+            except ConnectError as err:
+                _LOGGER.debug("Full exception:", exc_info=True)
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="connection_failed",
+                    translation_placeholders={"host": self.host},
+                ) from err
 
-        payload = dict(
-            filename=(
-                "icon.png",
-                self._icon_file,
-                "application/octet-stream",
-                {"Expires": "0"},
-            ),
-            type="0",
-            title=kwargs.get(ATTR_TITLE, ATTR_TITLE_DEFAULT),
-            msg=message,
-            duration="%i" % self._default_duration,
-            fontsize="%i" % FONTSIZES.get(self._default_fontsize),
-            position="%i" % POSITIONS.get(self._default_position),
-            bkgcolor="%s" % COLORS.get(self._default_color),
-            transparency="%i" % TRANSPARENCIES.get(self._default_transparency),
-            offset="0",
-            app=ATTR_TITLE_DEFAULT,
-            force="true",
-            interrupt="%i" % self._default_interrupt,
-        )
-
-        data = kwargs.get(ATTR_DATA)
+        data: dict | None = kwargs.get(ATTR_DATA)
+        title = kwargs.get(ATTR_TITLE, ATTR_TITLE_DEFAULT)
+        duration = None
+        fontsize = None
+        position = None
+        transparency = None
+        bkgcolor = None
+        interrupt = False
+        icon = None
+        image_file = None
         if data:
             if ATTR_DURATION in data:
-                duration = data.get(ATTR_DURATION)
                 try:
-                    payload[ATTR_DURATION] = "%i" % int(duration)
-                except ValueError:
-                    _LOGGER.warning("Invalid duration-value: %s", str(duration))
+                    duration = int(
+                        data.get(ATTR_DURATION, Notifications.DEFAULT_DURATION)
+                    )
+                except (OverflowError, TypeError, ValueError) as err:
+                    raise ServiceValidationError(
+                        translation_domain=DOMAIN,
+                        translation_key="invalid_duration",
+                        translation_placeholders={
+                            "duration": str(data.get(ATTR_DURATION))
+                        },
+                    ) from err
             if ATTR_FONTSIZE in data:
-                fontsize = data.get(ATTR_FONTSIZE)
-                if fontsize in FONTSIZES:
-                    payload[ATTR_FONTSIZE] = "%i" % FONTSIZES.get(fontsize)
+                if data.get(ATTR_FONTSIZE) in Notifications.FONTSIZES:
+                    fontsize = data.get(ATTR_FONTSIZE)
                 else:
-                    _LOGGER.warning("Invalid fontsize-value: %s", str(fontsize))
+                    _LOGGER.warning(
+                        "Invalid fontsize-value: %s", data.get(ATTR_FONTSIZE)
+                    )
             if ATTR_POSITION in data:
-                position = data.get(ATTR_POSITION)
-                if position in POSITIONS:
-                    payload[ATTR_POSITION] = "%i" % POSITIONS.get(position)
+                if data.get(ATTR_POSITION) in Notifications.POSITIONS:
+                    position = data.get(ATTR_POSITION)
                 else:
-                    _LOGGER.warning("Invalid position-value: %s", str(position))
+                    _LOGGER.warning(
+                        "Invalid position-value: %s", data.get(ATTR_POSITION)
+                    )
             if ATTR_TRANSPARENCY in data:
-                transparency = data.get(ATTR_TRANSPARENCY)
-                if transparency in TRANSPARENCIES:
-                    payload[ATTR_TRANSPARENCY] = "%i" % TRANSPARENCIES.get(transparency)
+                if data.get(ATTR_TRANSPARENCY) in Notifications.TRANSPARENCIES:
+                    transparency = data.get(ATTR_TRANSPARENCY)
                 else:
-                    _LOGGER.warning("Invalid transparency-value: %s", str(transparency))
+                    _LOGGER.warning(
+                        "Invalid transparency-value: %s",
+                        data.get(ATTR_TRANSPARENCY),
+                    )
             if ATTR_COLOR in data:
-                color = data.get(ATTR_COLOR)
-                if color in COLORS:
-                    payload[ATTR_BKGCOLOR] = "%s" % COLORS.get(color)
+                if data.get(ATTR_COLOR) in Notifications.BKG_COLORS:
+                    bkgcolor = data.get(ATTR_COLOR)
                 else:
-                    _LOGGER.warning("Invalid color-value: %s", str(color))
+                    _LOGGER.warning("Invalid color-value: %s", data.get(ATTR_COLOR))
             if ATTR_INTERRUPT in data:
-                interrupt = data.get(ATTR_INTERRUPT)
                 try:
-                    payload[ATTR_INTERRUPT] = "%i" % cv.boolean(interrupt)
-                except vol.Invalid:
-                    _LOGGER.warning("Invalid interrupt-value: %s", str(interrupt))
-            filedata = data.get(ATTR_FILE) if data else None
-            if filedata is not None:
-                # Load from file or URL
-                file_as_bytes = self.load_file(
-                    url=filedata.get(ATTR_FILE_URL),
-                    local_path=filedata.get(ATTR_FILE_PATH),
-                    username=filedata.get(ATTR_FILE_USERNAME),
-                    password=filedata.get(ATTR_FILE_PASSWORD),
-                    auth=filedata.get(ATTR_FILE_AUTH),
-                )
-                if file_as_bytes:
-                    payload[ATTR_IMAGE] = (
-                        "image",
-                        file_as_bytes,
-                        "application/octet-stream",
-                        {"Expires": "0"},
+                    interrupt = cv.boolean(data.get(ATTR_INTERRUPT))
+                except probatio.Invalid as err:
+                    raise ServiceValidationError(
+                        translation_domain=DOMAIN,
+                        translation_key="invalid_interrupt",
+                        translation_placeholders={
+                            "interrupt": str(data.get(ATTR_INTERRUPT))
+                        },
+                    ) from err
+            if imagedata := data.get(ATTR_IMAGE):
+                if isinstance(imagedata, str):
+                    image_file = (
+                        self.load_file(url=imagedata)
+                        if imagedata.startswith("http")
+                        else self.load_file(local_path=imagedata)
+                    )
+                elif isinstance(imagedata, dict):
+                    image_file = self.load_file(
+                        url=imagedata.get(ATTR_IMAGE_URL),
+                        local_path=imagedata.get(ATTR_IMAGE_PATH),
+                        username=imagedata.get(ATTR_IMAGE_USERNAME),
+                        password=imagedata.get(ATTR_IMAGE_PASSWORD),
+                        auth=imagedata.get(ATTR_IMAGE_AUTH),
+                    )
+                else:
+                    raise ServiceValidationError(
+                        translation_domain=DOMAIN,
+                        translation_key="invalid_notification_image",
+                        translation_placeholders={"type": type(imagedata).__name__},
+                    )
+            if icondata := data.get(_ATTR_ICON):
+                if isinstance(icondata, str):
+                    icondata = (
+                        self.load_file(url=icondata)
+                        if icondata.startswith("http")
+                        else self.load_file(local_path=icondata)
+                    )
+                elif isinstance(icondata, dict):
+                    icon = self.load_file(
+                        url=icondata.get(ATTR_ICON_URL),
+                        local_path=icondata.get(ATTR_ICON_PATH),
+                        username=icondata.get(ATTR_ICON_USERNAME),
+                        password=icondata.get(ATTR_ICON_PASSWORD),
+                        auth=icondata.get(ATTR_ICON_AUTH),
+                    )
+                else:
+                    raise ServiceValidationError(
+                        translation_domain=DOMAIN,
+                        translation_key="invalid_notification_icon",
+                        translation_placeholders={"type": type(icondata).__name__},
                     )
 
         try:
-            _LOGGER.debug("Payload: %s", str(payload))
-            response = requests.post(self._target, files=payload, timeout=self._timeout)
-            if response.status_code != 200:
-                _LOGGER.error("Error sending message: %s", str(response))
-        except requests.exceptions.ConnectionError as err:
-            _LOGGER.error("Error communicating with %s: %s", self._target, str(err))
+            self.notify.send(
+                nl2br(message),
+                title=title,
+                duration=duration,
+                fontsize=fontsize,
+                position=position,
+                bkgcolor=bkgcolor,
+                transparency=transparency,
+                interrupt=interrupt,
+                icon=icon,
+                image_file=image_file,
+            )
+        except ConnectError as err:
+            _LOGGER.debug("Full exception:", exc_info=True)
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="connection_failed",
+                translation_placeholders={"host": self.host},
+            ) from err
 
     def load_file(
-        self, url=None, local_path=None, username=None, password=None, auth=None
-    ):
+        self,
+        url: str | None = None,
+        local_path: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        auth: str | None = None,
+    ) -> BufferedReader | bytes | None:
         """Load image/document/etc from a local path or URL."""
         try:
             if url is not None:
                 # Check whether authentication parameters are provided
                 if username is not None and password is not None:
                     # Use digest or basic authentication
-                    if ATTR_FILE_AUTH_DIGEST == auth:
+                    auth_: HTTPDigestAuth | HTTPBasicAuth
+                    if auth in (ATTR_IMAGE_AUTH_DIGEST, ATTR_ICON_AUTH_DIGEST):
                         auth_ = HTTPDigestAuth(username, password)
                     else:
                         auth_ = HTTPBasicAuth(username, password)

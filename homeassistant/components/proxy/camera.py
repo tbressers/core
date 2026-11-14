@@ -1,23 +1,28 @@
 """Proxy camera platform that enables image processing of camera data."""
+
 import asyncio
 from datetime import timedelta
 import io
 import logging
+from typing import override
 
 from PIL import Image
-import voluptuous as vol
+import probatio
 
 from homeassistant.components.camera import (
-    PLATFORM_SCHEMA,
+    PLATFORM_SCHEMA as CAMERA_PLATFORM_SCHEMA,
     Camera,
     async_get_image,
     async_get_mjpeg_stream,
     async_get_still_stream,
 )
 from homeassistant.const import CONF_ENTITY_ID, CONF_MODE, CONF_NAME
+from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
-import homeassistant.util.dt as dt_util
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.util import dt as dt_util
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -39,27 +44,34 @@ MODE_CROP = "crop"
 DEFAULT_BASENAME = "Camera Proxy"
 DEFAULT_QUALITY = 75
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
+PLATFORM_SCHEMA = CAMERA_PLATFORM_SCHEMA.extend(
     {
-        vol.Required(CONF_ENTITY_ID): cv.entity_id,
-        vol.Optional(CONF_NAME): cv.string,
-        vol.Optional(CONF_CACHE_IMAGES, False): cv.boolean,
-        vol.Optional(CONF_FORCE_RESIZE, False): cv.boolean,
-        vol.Optional(CONF_MODE, default=MODE_RESIZE): vol.In([MODE_RESIZE, MODE_CROP]),
-        vol.Optional(CONF_IMAGE_QUALITY): int,
-        vol.Optional(CONF_IMAGE_REFRESH_RATE): float,
-        vol.Optional(CONF_MAX_IMAGE_WIDTH): int,
-        vol.Optional(CONF_MAX_IMAGE_HEIGHT): int,
-        vol.Optional(CONF_MAX_STREAM_WIDTH): int,
-        vol.Optional(CONF_MAX_STREAM_HEIGHT): int,
-        vol.Optional(CONF_IMAGE_LEFT): int,
-        vol.Optional(CONF_IMAGE_TOP): int,
-        vol.Optional(CONF_STREAM_QUALITY): int,
+        probatio.Required(CONF_ENTITY_ID): cv.entity_id,
+        probatio.Optional(CONF_NAME): cv.string,
+        probatio.Optional(CONF_CACHE_IMAGES, default=False): cv.boolean,
+        probatio.Optional(CONF_FORCE_RESIZE, default=False): cv.boolean,
+        probatio.Optional(CONF_MODE, default=MODE_RESIZE): probatio.In(
+            [MODE_RESIZE, MODE_CROP]
+        ),
+        probatio.Optional(CONF_IMAGE_QUALITY): int,
+        probatio.Optional(CONF_IMAGE_REFRESH_RATE): float,
+        probatio.Optional(CONF_MAX_IMAGE_WIDTH): int,
+        probatio.Optional(CONF_MAX_IMAGE_HEIGHT): int,
+        probatio.Optional(CONF_MAX_STREAM_WIDTH): int,
+        probatio.Optional(CONF_MAX_STREAM_HEIGHT): int,
+        probatio.Optional(CONF_IMAGE_LEFT): int,
+        probatio.Optional(CONF_IMAGE_TOP): int,
+        probatio.Optional(CONF_STREAM_QUALITY): int,
     }
 )
 
 
-async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
+async def async_setup_platform(
+    hass: HomeAssistant,
+    config: ConfigType,
+    async_add_entities: AddEntitiesCallback,
+    discovery_info: DiscoveryInfoType | None = None,
+) -> None:
     """Set up the Proxy camera platform."""
     async_add_entities([ProxyCamera(hass, config)])
 
@@ -67,16 +79,18 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
 def _precheck_image(image, opts):
     """Perform some pre-checks on the given image."""
     if not opts:
-        raise ValueError()
+        raise ValueError
     try:
         img = Image.open(io.BytesIO(image))
-    except OSError:
+    except OSError as err:
         _LOGGER.warning("Failed to open image")
-        raise ValueError()
+        raise ValueError from err
     imgfmt = str(img.format)
     if imgfmt not in ("PNG", "JPEG"):
         _LOGGER.warning("Image is of unsupported type: %s", imgfmt)
-        raise ValueError()
+        raise ValueError
+    if img.mode != "RGB":
+        img = img.convert("RGB")
     return img
 
 
@@ -91,6 +105,15 @@ def _resize_image(image, opts):
     new_width = opts.max_width
     (old_width, old_height) = img.size
     old_size = len(image)
+
+    # If no max_width specified, only apply quality changes if requested
+    if new_width is None:
+        if opts.quality is None:
+            return image
+        imgbuf = io.BytesIO()
+        img.save(imgbuf, "JPEG", optimize=True, quality=quality)
+        return imgbuf.getvalue()
+
     if old_width <= new_width:
         if opts.quality is None:
             _LOGGER.debug("Image is smaller-than/equal-to requested width")
@@ -98,16 +121,18 @@ def _resize_image(image, opts):
         new_width = old_width
 
     scale = new_width / float(old_width)
-    new_height = int((float(old_height) * float(scale)))
+    new_height = int(float(old_height) * float(scale))
 
-    img = img.resize((new_width, new_height), Image.ANTIALIAS)
+    img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
     imgbuf = io.BytesIO()
     img.save(imgbuf, "JPEG", optimize=True, quality=quality)
     newimage = imgbuf.getvalue()
     if not opts.force_resize and len(newimage) >= old_size:
         _LOGGER.debug(
-            "Using original image (%d bytes) "
-            "because resized image (%d bytes) is not smaller",
+            (
+                "Using original image (%d bytes) "
+                "because resized image (%d bytes) is not smaller"
+            ),
             old_size,
             len(newimage),
         )
@@ -135,18 +160,25 @@ def _crop_image(image, opts):
     quality = opts.quality or DEFAULT_QUALITY
     (old_width, old_height) = img.size
     old_size = len(image)
-    if opts.top is None:
-        opts.top = 0
-    if opts.left is None:
-        opts.left = 0
-    if opts.max_width is None or opts.max_width > old_width - opts.left:
-        opts.max_width = old_width - opts.left
-    if opts.max_height is None or opts.max_height > old_height - opts.top:
-        opts.max_height = old_height - opts.top
+    top = opts.top or 0
+    left = opts.left or 0
+    width = old_width - left
+    if opts.max_width is not None:
+        width = min(opts.max_width, width)
+    height = old_height - top
+    if opts.max_height is not None:
+        height = min(opts.max_height, height)
+    if width <= 0 or height <= 0:
+        _LOGGER.debug(
+            "Image (%dx%d) is too small to crop at (%d, %d)",
+            old_width,
+            old_height,
+            left,
+            top,
+        )
+        return image
 
-    img = img.crop(
-        (opts.left, opts.top, opts.left + opts.max_width, opts.top + opts.max_height)
-    )
+    img = img.crop((left, top, left + width, top + height))
     imgbuf = io.BytesIO()
     img.save(imgbuf, "JPEG", optimize=True, quality=quality)
     newimage = imgbuf.getvalue()
@@ -156,8 +188,8 @@ def _crop_image(image, opts):
         old_width,
         old_height,
         old_size,
-        opts.max_width,
-        opts.max_height,
+        width,
+        height,
         len(newimage),
     )
     return newimage
@@ -188,8 +220,8 @@ class ProxyCamera(Camera):
         super().__init__()
         self.hass = hass
         self._proxied_camera = config.get(CONF_ENTITY_ID)
-        self._name = config.get(CONF_NAME) or "{} - {}".format(
-            DEFAULT_BASENAME, self._proxied_camera
+        self._name = (
+            config.get(CONF_NAME) or f"{DEFAULT_BASENAME} - {self._proxied_camera}"
         )
         self._image_opts = ImageOpts(
             config.get(CONF_MAX_IMAGE_WIDTH),
@@ -217,13 +249,19 @@ class ProxyCamera(Camera):
         self._last_image = None
         self._mode = config.get(CONF_MODE)
 
-    def camera_image(self):
+    @override
+    def camera_image(
+        self, width: int | None = None, height: int | None = None
+    ) -> bytes | None:
         """Return camera image."""
         return asyncio.run_coroutine_threadsafe(
             self.async_camera_image(), self.hass.loop
         ).result()
 
-    async def async_camera_image(self):
+    @override
+    async def async_camera_image(
+        self, width: int | None = None, height: int | None = None
+    ) -> bytes | None:
         """Return a still image response from the camera."""
         now = dt_util.utcnow()
 
@@ -242,14 +280,15 @@ class ProxyCamera(Camera):
             job = _resize_image
         else:
             job = _crop_image
-        image = await self.hass.async_add_executor_job(
+        image_bytes: bytes = await self.hass.async_add_executor_job(
             job, image.content, self._image_opts
         )
 
         if self._cache_images:
-            self._last_image = image
-        return image
+            self._last_image = image_bytes
+        return image_bytes
 
+    @override
     async def handle_async_mjpeg_stream(self, request):
         """Generate an HTTP MJPEG stream from camera images."""
         if not self._stream_opts:
@@ -258,10 +297,11 @@ class ProxyCamera(Camera):
             )
 
         return await async_get_still_stream(
-            request, self._async_stream_image, self.content_type, self.frame_interval,
+            request, self._async_stream_image, self.content_type, self.frame_interval
         )
 
     @property
+    @override
     def name(self):
         """Return the name of this camera."""
         return self._name
@@ -272,8 +312,8 @@ class ProxyCamera(Camera):
             image = await async_get_image(self.hass, self._proxied_camera)
             if not image:
                 return None
-        except HomeAssistantError:
-            raise asyncio.CancelledError()
+        except HomeAssistantError as err:
+            raise asyncio.CancelledError from err
 
         if self._mode == MODE_RESIZE:
             job = _resize_image

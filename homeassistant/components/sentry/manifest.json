@@ -1,12 +1,12 @@
 {
   "domain": "sentry",
   "name": "Sentry",
+  "categories": ["computers_network.cloud_developer_tools"],
+  "codeowners": ["@dcramer", "@frenck"],
   "config_flow": true,
+  "connectivity": ["cloud"],
   "documentation": "https://www.home-assistant.io/integrations/sentry",
-  "requirements": ["sentry-sdk==0.13.5"],
-  "ssdp": [],
-  "zeroconf": [],
-  "homekit": {},
-  "dependencies": [],
-  "codeowners": ["@dcramer"]
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
+  "requirements": ["sentry-sdk==2.48.0"]
 }

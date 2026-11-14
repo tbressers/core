@@ -1,25 +1,48 @@
 """Permissions for Home Assistant."""
-import logging
-from typing import Any, Callable, Optional
 
-import voluptuous as vol
+from collections.abc import Callable, Iterable
+from typing import TYPE_CHECKING, override
+
+import probatio
 
 from .const import CAT_ENTITIES
 from .entities import ENTITY_POLICY_SCHEMA, compile_entities
-from .merge import merge_policies  # noqa: F401
+from .merge import merge_policies
 from .models import PermissionLookup
 from .types import PolicyType
 from .util import test_all
 
-POLICY_SCHEMA = vol.Schema({vol.Optional(CAT_ENTITIES): ENTITY_POLICY_SCHEMA})
+if TYPE_CHECKING:
+    from ..models import User
 
-_LOGGER = logging.getLogger(__name__)
+POLICY_SCHEMA = probatio.Schema({probatio.Optional(CAT_ENTITIES): ENTITY_POLICY_SCHEMA})
+
+__all__ = [
+    "POLICY_SCHEMA",
+    "AbstractPermissions",
+    "OwnerPermissions",
+    "PermissionLookup",
+    "PolicyPermissions",
+    "PolicyType",
+    "filter_entity_ids_by_permission",
+    "merge_policies",
+]
+
+
+def filter_entity_ids_by_permission(
+    user: User, entity_ids: Iterable[str], key: str
+) -> list[str]:
+    """Filter entity IDs to those the user can access for the given policy key."""
+    if user.is_admin or user.permissions.access_all_entities(key):
+        return list(entity_ids)
+    check_entity = user.permissions.check_entity
+    return [entity_id for entity_id in entity_ids if check_entity(entity_id, key)]
 
 
 class AbstractPermissions:
     """Default permissions class."""
 
-    _cached_entity_func: Optional[Callable[[str, str], bool]] = None
+    _cached_entity_func: Callable[[str, str], bool] | None = None
 
     def _entity_func(self) -> Callable[[str, str], bool]:
         """Return a function that can test entity access."""
@@ -31,9 +54,7 @@ class AbstractPermissions:
 
     def check_entity(self, entity_id: str, key: str) -> bool:
         """Check if we can access entity."""
-        entity_func = self._cached_entity_func
-
-        if entity_func is None:
+        if (entity_func := self._cached_entity_func) is None:
             entity_func = self._cached_entity_func = self._entity_func()
 
         return entity_func(entity_id, key)
@@ -47,15 +68,18 @@ class PolicyPermissions(AbstractPermissions):
         self._policy = policy
         self._perm_lookup = perm_lookup
 
+    @override
     def access_all_entities(self, key: str) -> bool:
         """Check if we have a certain access to all entities."""
         return test_all(self._policy.get(CAT_ENTITIES), key)
 
+    @override
     def _entity_func(self) -> Callable[[str, str], bool]:
         """Return a function that can test entity access."""
         return compile_entities(self._policy.get(CAT_ENTITIES), self._perm_lookup)
 
-    def __eq__(self, other: Any) -> bool:
+    @override
+    def __eq__(self, other: object) -> bool:
         """Equals check."""
         return isinstance(other, PolicyPermissions) and other._policy == self._policy
 
@@ -63,13 +87,15 @@ class PolicyPermissions(AbstractPermissions):
 class _OwnerPermissions(AbstractPermissions):
     """Owner permissions."""
 
+    @override
     def access_all_entities(self, key: str) -> bool:
         """Check if we have a certain access to all entities."""
         return True
 
+    @override
     def _entity_func(self) -> Callable[[str, str], bool]:
         """Return a function that can test entity access."""
         return lambda entity_id, key: True
 
 
-OwnerPermissions = _OwnerPermissions()  # pylint: disable=invalid-name
+OwnerPermissions = _OwnerPermissions()

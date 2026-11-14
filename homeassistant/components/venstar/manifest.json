@@ -1,8 +1,13 @@
 {
   "domain": "venstar",
   "name": "Venstar",
+  "categories": ["climate.thermostats_heating"],
+  "codeowners": ["@garbled1", "@jhollowe"],
+  "config_flow": true,
+  "connectivity": ["network"],
   "documentation": "https://www.home-assistant.io/integrations/venstar",
-  "requirements": ["venstarcolortouch==0.12"],
-  "dependencies": [],
-  "codeowners": []
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "loggers": ["venstarcolortouch"],
+  "requirements": ["venstarcolortouch==0.22"]
 }

@@ -1,313 +1,329 @@
 """Support for interface with an Samsung TV."""
+
 import asyncio
-from datetime import timedelta
+from typing import TYPE_CHECKING, Any, override
 
-from samsungctl import Remote as SamsungRemote, exceptions as samsung_exceptions
-import voluptuous as vol
-from websocket import WebSocketException
+import probatio
 
-from homeassistant.components.media_player import DEVICE_CLASS_TV, MediaPlayerDevice
-from homeassistant.components.media_player.const import (
-    MEDIA_TYPE_CHANNEL,
-    SUPPORT_NEXT_TRACK,
-    SUPPORT_PAUSE,
-    SUPPORT_PLAY,
-    SUPPORT_PLAY_MEDIA,
-    SUPPORT_PREVIOUS_TRACK,
-    SUPPORT_SELECT_SOURCE,
-    SUPPORT_TURN_OFF,
-    SUPPORT_TURN_ON,
-    SUPPORT_VOLUME_MUTE,
-    SUPPORT_VOLUME_STEP,
+from homeassistant.components.media_player import (
+    MediaPlayerDeviceClass,
+    MediaPlayerEntity,
+    MediaPlayerEntityFeature,
+    MediaPlayerState,
+    MediaType,
 )
-from homeassistant.const import (
-    CONF_HOST,
-    CONF_ID,
-    CONF_IP_ADDRESS,
-    CONF_METHOD,
-    CONF_NAME,
-    CONF_PORT,
-    STATE_OFF,
-    STATE_ON,
-)
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.script import Script
-from homeassistant.util import dt as dt_util
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.util.async_ import create_eager_task
 
-from .const import CONF_MANUFACTURER, CONF_MODEL, CONF_ON_ACTION, DOMAIN, LOGGER
+from .bridge import SamsungTVWSBridge
+from .const import CONF_SSDP_RENDERING_CONTROL_LOCATION, DOMAIN, LOGGER
+from .coordinator import SamsungTVConfigEntry, SamsungTVDataUpdateCoordinator
+from .dmr import SamsungTVDmrDevice
+from .entity import SamsungTVEntity
 
-KEY_PRESS_TIMEOUT = 1.2
 SOURCES = {"TV": "KEY_TV", "HDMI": "KEY_HDMI"}
 
 SUPPORT_SAMSUNGTV = (
-    SUPPORT_PAUSE
-    | SUPPORT_VOLUME_STEP
-    | SUPPORT_VOLUME_MUTE
-    | SUPPORT_PREVIOUS_TRACK
-    | SUPPORT_SELECT_SOURCE
-    | SUPPORT_NEXT_TRACK
-    | SUPPORT_TURN_OFF
-    | SUPPORT_PLAY
-    | SUPPORT_PLAY_MEDIA
+    MediaPlayerEntityFeature.NEXT_TRACK
+    | MediaPlayerEntityFeature.PAUSE
+    | MediaPlayerEntityFeature.PLAY
+    | MediaPlayerEntityFeature.PLAY_MEDIA
+    | MediaPlayerEntityFeature.PREVIOUS_TRACK
+    | MediaPlayerEntityFeature.SELECT_SOURCE
+    | MediaPlayerEntityFeature.STOP
+    | MediaPlayerEntityFeature.TURN_OFF
+    | MediaPlayerEntityFeature.VOLUME_MUTE
+    | MediaPlayerEntityFeature.VOLUME_SET
+    | MediaPlayerEntityFeature.VOLUME_STEP
 )
 
 
-async def async_setup_platform(
-    hass, config, add_entities, discovery_info=None
-):  # pragma: no cover
-    """Set up the Samsung TV platform."""
-    pass
+# Max delay waiting for app_list to return, as some TVs simply ignore the request
+APP_LIST_DELAY = 3
+
+# Coordinator is used to centralize the data updates
+PARALLEL_UPDATES = 0
 
 
-async def async_setup_entry(hass, config_entry, async_add_entities):
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: SamsungTVConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
     """Set up the Samsung TV from a config entry."""
-    ip_address = config_entry.data[CONF_IP_ADDRESS]
-    on_script = None
-    if (
-        DOMAIN in hass.data
-        and ip_address in hass.data[DOMAIN]
-        and CONF_ON_ACTION in hass.data[DOMAIN][ip_address]
-        and hass.data[DOMAIN][ip_address][CONF_ON_ACTION]
-    ):
-        turn_on_action = hass.data[DOMAIN][ip_address][CONF_ON_ACTION]
-        on_script = Script(hass, turn_on_action)
-    async_add_entities([SamsungTVDevice(config_entry, on_script)])
+    coordinator = entry.runtime_data
+    async_add_entities([SamsungTVDevice(coordinator)])
 
 
-class SamsungTVDevice(MediaPlayerDevice):
+class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
     """Representation of a Samsung TV."""
 
-    def __init__(self, config_entry, on_script):
+    _attr_source_list: list[str]
+    _attr_name = None
+    _attr_device_class = MediaPlayerDeviceClass.TV
+
+    def __init__(self, coordinator: SamsungTVDataUpdateCoordinator) -> None:
         """Initialize the Samsung device."""
-        self._config_entry = config_entry
-        self._manufacturer = config_entry.data.get(CONF_MANUFACTURER)
-        self._model = config_entry.data.get(CONF_MODEL)
-        self._name = config_entry.data.get(CONF_NAME)
-        self._on_script = on_script
-        self._uuid = config_entry.data.get(CONF_ID)
-        # Assume that the TV is not muted
-        self._muted = False
+        super().__init__(coordinator=coordinator)
+        self._ssdp_rendering_control_location: str | None = (
+            coordinator.config_entry.data.get(CONF_SSDP_RENDERING_CONTROL_LOCATION)
+        )
         # Assume that the TV is in Play mode
-        self._playing = True
-        self._state = None
-        self._remote = None
-        # Mark the end of a shutdown command (need to wait 15 seconds before
-        # sending the next command to avoid turning the TV back ON).
-        self._end_of_power_off = None
-        # Generate a configuration for the Samsung library
-        self._config = {
-            "name": "HomeAssistant",
-            "description": "HomeAssistant",
-            "id": "ha.component.samsung",
-            "method": config_entry.data[CONF_METHOD],
-            "port": config_entry.data.get(CONF_PORT),
-            "host": config_entry.data[CONF_HOST],
-            "timeout": 1,
-        }
+        self._playing: bool = True
 
-    def update(self):
-        """Update state of device."""
-        if self._power_off_in_progress():
-            self._state = STATE_OFF
+        self._attr_is_volume_muted: bool = False
+        self._attr_source_list = list(SOURCES)
+        self._app_list: dict[str, str] | None = None
+        self._app_list_event: asyncio.Event = asyncio.Event()
+
+        self._attr_supported_features = SUPPORT_SAMSUNGTV
+        self._dmr: SamsungTVDmrDevice | None = None
+        if self._ssdp_rendering_control_location:
+            self._attr_supported_features |= MediaPlayerEntityFeature.VOLUME_SET
+            if TYPE_CHECKING:
+                assert self._host is not None
+            self._dmr = SamsungTVDmrDevice(
+                hass=coordinator.hass,
+                ssdp_rendering_control_location=self._ssdp_rendering_control_location,
+                host=self._host,
+                on_event_callback=self._on_dmr_event_callback,
+            )
+
+    @property
+    @override
+    def supported_features(self) -> MediaPlayerEntityFeature:
+        """Flag media player features that are supported."""
+        # `turn_on` triggers are not yet registered during initialisation,
+        # so this property needs to be dynamic
+        if self._turn_on_action:
+            return self._attr_supported_features | MediaPlayerEntityFeature.TURN_ON
+        return self._attr_supported_features
+
+    def _update_sources(self) -> None:
+        self._attr_source_list = list(SOURCES)
+        if app_list := self._app_list:
+            self._attr_source_list.extend(app_list)
+
+    def _app_list_callback(self, app_list: dict[str, str]) -> None:
+        """App list callback."""
+        self._app_list = app_list
+        self._update_sources()
+        self._app_list_event.set()
+
+    @override
+    async def async_added_to_hass(self) -> None:
+        """Run when entity about to be added to hass."""
+        await super().async_added_to_hass()
+
+        self.async_on_remove(
+            self._bridge.register_app_list_callback(self._app_list_callback)
+        )
+        await self._async_extra_update()
+        self.coordinator.async_extra_update = self._async_extra_update
+
+        if self.coordinator.is_on:
+            self._attr_state = MediaPlayerState.ON
+            self._update_from_upnp()
         else:
-            if self._remote is not None:
-                # Close the current remote connection
-                self._remote.close()
-                self._remote = None
+            self._attr_state = MediaPlayerState.OFF
 
-            try:
-                self.get_remote()
-                if self._remote:
-                    self._state = STATE_ON
-            except (
-                samsung_exceptions.UnhandledResponse,
-                samsung_exceptions.AccessDenied,
-            ):
-                # We got a response so it's working.
-                self._state = STATE_ON
-            except (OSError, WebSocketException):
-                # Different reasons, e.g. hostname not resolveable
-                self._state = STATE_OFF
+    @override
+    async def async_will_remove_from_hass(self) -> None:
+        """Handle removal."""
+        self.coordinator.async_extra_update = None
+        if self._dmr:
+            await self._dmr.async_shutdown()
 
-    def get_remote(self):
-        """Create or return a remote control instance."""
-        if self._remote is None:
-            # We need to create a new instance to reconnect.
-            try:
-                self._remote = SamsungRemote(self._config.copy())
-            # This is only happening when the auth was switched to DENY
-            # A removed auth will lead to socket timeout because waiting for auth popup is just an open socket
-            except samsung_exceptions.AccessDenied:
-                self.hass.async_create_task(
-                    self.hass.config_entries.flow.async_init(
-                        DOMAIN,
-                        context={"source": "reauth"},
-                        data=self._config_entry.data,
-                    )
-                )
-                raise
+    @callback
+    @override
+    def _handle_coordinator_update(self) -> None:
+        """Handle data update."""
+        if self.coordinator.is_on:
+            self._attr_state = MediaPlayerState.ON
+            self._update_from_upnp()
+        else:
+            self._attr_state = MediaPlayerState.OFF
+        self.async_write_ha_state()
 
-        return self._remote
+    async def _async_extra_update(self) -> None:
+        """Update state of device."""
+        if not self.coordinator.is_on:
+            if self._dmr:
+                await self._dmr.async_unsubscribe()
+            return
 
-    def send_key(self, key):
-        """Send a key to the tv and handles exceptions."""
-        if self._power_off_in_progress() and key not in ("KEY_POWER", "KEY_POWEROFF"):
-            LOGGER.info("TV is powering off, not sending command: %s", key)
+        startup_tasks: list[asyncio.Task[Any]] = []
+
+        if not self._app_list_event.is_set():
+            startup_tasks.append(create_eager_task(self._async_startup_app_list()))
+
+        if self._dmr:
+            startup_tasks.append(create_eager_task(self._dmr.async_ensure_subscribed()))
+
+        if startup_tasks:
+            await asyncio.gather(*startup_tasks)
+
+    @callback
+    def _update_from_upnp(self) -> bool:
+        # Upnp events can affect other attributes that we currently do not track
+        # We want to avoid checking every attribute in 'async_write_ha_state' as we
+        # currently only care about two attributes
+        if self._dmr is None:
+            return False
+
+        has_updates = False
+
+        if (
+            volume_level := self._dmr.volume_level
+        ) is not None and self._attr_volume_level != volume_level:
+            self._attr_volume_level = volume_level
+            has_updates = True
+
+        if (
+            is_muted := self._dmr.is_volume_muted
+        ) is not None and self._attr_is_volume_muted != is_muted:
+            self._attr_is_volume_muted = is_muted
+            has_updates = True
+
+        return has_updates
+
+    async def _async_startup_app_list(self) -> None:
+        await self._bridge.async_request_app_list()
+        if self._app_list_event.is_set():
+            # The try+wait_for is a bit expensive so we should try not to
+            # enter it unless we have to (Python 3.11 will have zero cost try)
             return
         try:
-            # recreate connection if connection was dead
-            retry_count = 1
-            for _ in range(retry_count + 1):
-                try:
-                    self.get_remote().control(key)
-                    break
-                except (
-                    samsung_exceptions.ConnectionClosed,
-                    BrokenPipeError,
-                    WebSocketException,
-                ):
-                    # BrokenPipe can occur when the commands is sent to fast
-                    # WebSocketException can occur when timed out
-                    self._remote = None
-        except (samsung_exceptions.UnhandledResponse, samsung_exceptions.AccessDenied):
-            # We got a response so it's on.
-            LOGGER.debug("Failed sending command %s", key, exc_info=True)
-        except OSError:
-            # Different reasons, e.g. hostname not resolveable
-            pass
+            async with asyncio.timeout(APP_LIST_DELAY):
+                await self._app_list_event.wait()
+        except TimeoutError as err:
+            # No need to try again
+            self._app_list_event.set()
+            LOGGER.debug("Failed to load app list from %s: %r", self._host, err)
 
-    def _power_off_in_progress(self):
-        return (
-            self._end_of_power_off is not None
-            and self._end_of_power_off > dt_util.utcnow()
-        )
+    @callback
+    def _on_dmr_event_callback(self) -> None:
+        """Handle UPnP state variable changes from DMR device."""
+        # Events can arrive before the entity has been added to hass
+        if self._update_from_upnp() and self.entity_id:
+            self.async_write_ha_state()
 
-    @property
-    def unique_id(self) -> str:
-        """Return the unique ID of the device."""
-        return self._uuid
+    async def _async_launch_app(self, app_id: str) -> None:
+        """Send launch_app to the tv."""
+        if self._bridge.power_off_in_progress:
+            LOGGER.debug("TV is powering off, not sending launch_app command")
+            return
+        assert isinstance(self._bridge, SamsungTVWSBridge)
+        await self._bridge.async_launch_app(app_id)
 
-    @property
-    def name(self):
-        """Return the name of the device."""
-        return self._name
+    async def _async_send_keys(self, keys: list[str]) -> None:
+        """Send a key to the tv and handles exceptions."""
+        assert keys
+        if self._bridge.power_off_in_progress and keys[0] != "KEY_POWEROFF":
+            LOGGER.debug("TV is powering off, not sending keys: %s", keys)
+            return
+        await self._bridge.async_send_keys(keys)
 
-    @property
-    def state(self):
-        """Return the state of the device."""
-        return self._state
+    @override
+    async def async_set_volume_level(self, volume: float) -> None:
+        """Set volume level on the media player."""
+        if self._dmr is None:
+            if TYPE_CHECKING:
+                assert self._host is not None
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="upnp_not_available",
+                translation_placeholders={"host": self._host},
+            )
+        await self._dmr.async_set_volume_level(volume)
 
-    @property
-    def device_info(self):
-        """Return device specific attributes."""
-        return {
-            "name": self.name,
-            "identifiers": {(DOMAIN, self.unique_id)},
-            "manufacturer": self._manufacturer,
-            "model": self._model,
-        }
-
-    @property
-    def is_volume_muted(self):
-        """Boolean if volume is currently muted."""
-        return self._muted
-
-    @property
-    def source_list(self):
-        """List of available input sources."""
-        return list(SOURCES)
-
-    @property
-    def supported_features(self):
-        """Flag media player features that are supported."""
-        if self._on_script:
-            return SUPPORT_SAMSUNGTV | SUPPORT_TURN_ON
-        return SUPPORT_SAMSUNGTV
-
-    @property
-    def device_class(self):
-        """Set the device class to TV."""
-        return DEVICE_CLASS_TV
-
-    def turn_off(self):
-        """Turn off media player."""
-        self._end_of_power_off = dt_util.utcnow() + timedelta(seconds=15)
-
-        if self._config["method"] == "websocket":
-            self.send_key("KEY_POWER")
-        else:
-            self.send_key("KEY_POWEROFF")
-        # Force closing of remote session to provide instant UI feedback
-        try:
-            self.get_remote().close()
-            self._remote = None
-        except OSError:
-            LOGGER.debug("Could not establish connection.")
-
-    def volume_up(self):
+    @override
+    async def async_volume_up(self) -> None:
         """Volume up the media player."""
-        self.send_key("KEY_VOLUP")
+        await self._async_send_keys(["KEY_VOLUP"])
 
-    def volume_down(self):
+    @override
+    async def async_volume_down(self) -> None:
         """Volume down media player."""
-        self.send_key("KEY_VOLDOWN")
+        await self._async_send_keys(["KEY_VOLDOWN"])
 
-    def mute_volume(self, mute):
+    @override
+    async def async_mute_volume(self, mute: bool) -> None:
         """Send mute command."""
-        self.send_key("KEY_MUTE")
+        await self._async_send_keys(["KEY_MUTE"])
 
-    def media_play_pause(self):
+    @override
+    async def async_media_play_pause(self) -> None:
         """Simulate play pause media player."""
         if self._playing:
-            self.media_pause()
+            await self.async_media_pause()
         else:
-            self.media_play()
+            await self.async_media_play()
 
-    def media_play(self):
+    @override
+    async def async_media_play(self) -> None:
         """Send play command."""
         self._playing = True
-        self.send_key("KEY_PLAY")
+        await self._async_send_keys(["KEY_PLAY"])
 
-    def media_pause(self):
+    @override
+    async def async_media_pause(self) -> None:
         """Send media pause command to media player."""
         self._playing = False
-        self.send_key("KEY_PAUSE")
+        await self._async_send_keys(["KEY_PAUSE"])
 
-    def media_next_track(self):
+    @override
+    async def async_media_next_track(self) -> None:
         """Send next track command."""
-        self.send_key("KEY_CHUP")
+        await self._async_send_keys(["KEY_CHUP"])
 
-    def media_previous_track(self):
+    @override
+    async def async_media_previous_track(self) -> None:
         """Send the previous track command."""
-        self.send_key("KEY_CHDOWN")
+        await self._async_send_keys(["KEY_CHDOWN"])
 
-    async def async_play_media(self, media_type, media_id, **kwargs):
+    @override
+    async def async_play_media(
+        self, media_type: MediaType | str, media_id: str, **kwargs: Any
+    ) -> None:
         """Support changing a channel."""
-        if media_type != MEDIA_TYPE_CHANNEL:
+        if media_type == MediaType.APP:
+            await self._async_launch_app(media_id)
+            return
+
+        if media_type != MediaType.CHANNEL:
             LOGGER.error("Unsupported media type")
             return
 
         # media_id should only be a channel number
         try:
             cv.positive_int(media_id)
-        except vol.Invalid:
-            LOGGER.error("Media ID must be positive integer")
-            return
+        except probatio.Invalid as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="media_id_invalid",
+            ) from err
 
-        for digit in media_id:
-            await self.hass.async_add_executor_job(self.send_key, f"KEY_{digit}")
-            await asyncio.sleep(KEY_PRESS_TIMEOUT, self.hass.loop)
-        await self.hass.async_add_executor_job(self.send_key, "KEY_ENTER")
+        await self._async_send_keys(
+            keys=[f"KEY_{digit}" for digit in media_id] + ["KEY_ENTER"]
+        )
 
-    async def async_turn_on(self):
-        """Turn the media player on."""
-        if self._on_script:
-            await self._on_script.async_run()
-
-    def select_source(self, source):
+    @override
+    async def async_select_source(self, source: str) -> None:
         """Select input source."""
-        if source not in SOURCES:
-            LOGGER.error("Unsupported source")
+        if self._app_list and source in self._app_list:
+            await self._async_launch_app(self._app_list[source])
             return
 
-        self.send_key(SOURCES[source])
+        if source in SOURCES:
+            await self._async_send_keys([SOURCES[source]])
+            return
+
+        raise HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key="source_unsupported",
+            translation_placeholders={"entity": self.entity_id, "source": source},
+        )

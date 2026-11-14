@@ -1,9 +1,9 @@
 {
   "domain": "browser",
   "name": "Browser",
-  "documentation": "https://www.home-assistant.io/integrations/browser",
-  "requirements": [],
-  "dependencies": [],
+  "categories": ["computers_network"],
   "codeowners": [],
+  "documentation": "https://www.home-assistant.io/integrations/browser",
+  "iot_class": "local_push",
   "quality_scale": "internal"
 }

@@ -1,37 +1,52 @@
 """Auth providers for Home Assistant."""
-import importlib
+
+from collections.abc import Mapping
 import logging
 import types
-from typing import Any, Dict, List, Optional
+from typing import Any, override
 
-import voluptuous as vol
-from voluptuous.humanize import humanize_error
+import probatio
+from probatio.humanize import humanize_error
 
-from homeassistant import data_entry_flow, requirements
+from homeassistant import requirements
 from homeassistant.const import CONF_ID, CONF_NAME, CONF_TYPE
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.data_entry_flow import FlowHandler
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.importlib import async_import_module
 from homeassistant.util import dt as dt_util
 from homeassistant.util.decorator import Registry
+from homeassistant.util.hass_dict import HassKey
 
 from ..auth_store import AuthStore
 from ..const import MFA_SESSION_EXPIRATION
-from ..models import Credentials, User, UserMeta
+from ..models import (
+    AuthFlowContext,
+    AuthFlowResult,
+    Credentials,
+    RefreshToken,
+    User,
+    UserMeta,
+)
 
 _LOGGER = logging.getLogger(__name__)
-DATA_REQS = "auth_prov_reqs_processed"
+DATA_REQS: HassKey[set[str]] = HassKey("auth_prov_reqs_processed")
 
-AUTH_PROVIDERS = Registry()
+AUTH_PROVIDERS: Registry[str, type[AuthProvider]] = Registry()
 
-AUTH_PROVIDER_SCHEMA = vol.Schema(
+AUTH_PROVIDER_SCHEMA = probatio.Schema(
     {
-        vol.Required(CONF_TYPE): str,
-        vol.Optional(CONF_NAME): str,
+        probatio.Required(CONF_TYPE): str,
+        probatio.Optional(CONF_NAME): str,
         # Specify ID if you have two auth providers for same type.
-        vol.Optional(CONF_ID): str,
+        probatio.Optional(CONF_ID): str,
     },
-    extra=vol.ALLOW_EXTRA,
+    extra=probatio.ALLOW_EXTRA,
 )
+
+
+class InvalidStepUpError(HomeAssistantError):
+    """Raised when a signed in user could not be verified again."""
 
 
 class AuthProvider:
@@ -40,7 +55,7 @@ class AuthProvider:
     DEFAULT_TITLE = "Unnamed auth provider"
 
     def __init__(
-        self, hass: HomeAssistant, store: AuthStore, config: Dict[str, Any]
+        self, hass: HomeAssistant, store: AuthStore, config: dict[str, Any]
     ) -> None:
         """Initialize an auth provider."""
         self.hass = hass
@@ -48,7 +63,7 @@ class AuthProvider:
         self.config = config
 
     @property
-    def id(self) -> Optional[str]:
+    def id(self) -> str | None:
         """Return id of the auth provider.
 
         Optional, can be None.
@@ -58,19 +73,14 @@ class AuthProvider:
     @property
     def type(self) -> str:
         """Return type of the provider."""
-        return self.config[CONF_TYPE]  # type: ignore
+        return self.config[CONF_TYPE]  # type: ignore[no-any-return]
 
     @property
     def name(self) -> str:
         """Return the name of the auth provider."""
-        return self.config.get(CONF_NAME, self.DEFAULT_TITLE)
+        return self.config.get(CONF_NAME, self.DEFAULT_TITLE)  # type: ignore[no-any-return]
 
-    @property
-    def support_mfa(self) -> bool:
-        """Return whether multi-factor auth supported by the auth provider."""
-        return True
-
-    async def async_credentials(self) -> List[Credentials]:
+    async def async_credentials(self) -> list[Credentials]:
         """Return all credentials of this provider."""
         users = await self.store.async_get_users()
         return [
@@ -84,7 +94,7 @@ class AuthProvider:
         ]
 
     @callback
-    def async_create_credentials(self, data: Dict[str, str]) -> Credentials:
+    def async_create_credentials(self, data: dict[str, str]) -> Credentials:
         """Create credentials."""
         return Credentials(
             auth_provider_type=self.type, auth_provider_id=self.id, data=data
@@ -92,15 +102,23 @@ class AuthProvider:
 
     # Implement by extending class
 
-    async def async_login_flow(self, context: Optional[Dict]) -> "LoginFlow":
+    async def async_login_flow(self, context: AuthFlowContext | None) -> LoginFlow[Any]:
         """Return the data flow for logging in with auth provider.
 
         Auth provider should extend LoginFlow and return an instance.
         """
         raise NotImplementedError
 
+    @callback
+    def async_can_start_login(self, context: AuthFlowContext) -> bool:
+        """Return if a login flow may be started with this provider for the context.
+
+        The login screen only offers the providers for which this returns True.
+        """
+        return True
+
     async def async_get_or_create_credentials(
-        self, flow_result: Dict[str, str]
+        self, flow_result: Mapping[str, str]
     ) -> Credentials:
         """Get credentials based on the flow result."""
         raise NotImplementedError
@@ -114,21 +132,39 @@ class AuthProvider:
         """
         raise NotImplementedError
 
+    async def async_verify_step_up(
+        self, user: User, data: Mapping[str, Any], context: AuthFlowContext | None
+    ) -> None:
+        """Verify a signed in user again, raising InvalidStepUpError if it fails."""
+        raise NotImplementedError
+
     async def async_initialize(self) -> None:
         """Initialize the auth provider."""
-        pass
+
+    async def async_will_remove_credentials(self, credentials: Credentials) -> None:
+        """Clean up provider owned data before credentials are removed."""
+
+    @callback
+    def async_validate_refresh_token(
+        self, refresh_token: RefreshToken, remote_ip: str | None = None
+    ) -> None:
+        """Verify a refresh token is still valid.
+
+        Optional hook for an auth provider to verify validity of a refresh token.
+        Should raise InvalidAuthError on errors.
+        """
 
 
 async def auth_provider_from_config(
-    hass: HomeAssistant, store: AuthStore, config: Dict[str, Any]
+    hass: HomeAssistant, store: AuthStore, config: dict[str, Any]
 ) -> AuthProvider:
     """Initialize an auth provider from a config."""
-    provider_name = config[CONF_TYPE]
+    provider_name: str = config[CONF_TYPE]
     module = await load_auth_provider_module(hass, provider_name)
 
     try:
-        config = module.CONFIG_SCHEMA(config)  # type: ignore
-    except vol.Invalid as err:
+        config = module.CONFIG_SCHEMA(config)
+    except probatio.Invalid as err:
         _LOGGER.error(
             "Invalid configuration for auth provider %s: %s",
             provider_name,
@@ -136,7 +172,7 @@ async def auth_provider_from_config(
         )
         raise
 
-    return AUTH_PROVIDERS[provider_name](hass, store, config)  # type: ignore
+    return AUTH_PROVIDERS[provider_name](hass, store, config)
 
 
 async def load_auth_provider_module(
@@ -144,23 +180,24 @@ async def load_auth_provider_module(
 ) -> types.ModuleType:
     """Load an auth provider."""
     try:
-        module = importlib.import_module(f"homeassistant.auth.providers.{provider}")
+        module = await async_import_module(
+            hass, f"homeassistant.auth.providers.{provider}"
+        )
     except ImportError as err:
         _LOGGER.error("Unable to load auth provider %s: %s", provider, err)
-        raise HomeAssistantError(f"Unable to load auth provider {provider}: {err}")
+        raise HomeAssistantError(
+            f"Unable to load auth provider {provider}: {err}"
+        ) from err
 
     if hass.config.skip_pip or not hasattr(module, "REQUIREMENTS"):
         return module
 
-    processed = hass.data.get(DATA_REQS)
-
-    if processed is None:
+    if (processed := hass.data.get(DATA_REQS)) is None:
         processed = hass.data[DATA_REQS] = set()
     elif provider in processed:
         return module
 
-    # https://github.com/python/mypy/issues/1424
-    reqs = module.REQUIREMENTS  # type: ignore
+    reqs = module.REQUIREMENTS
     await requirements.async_process_requirements(
         hass, f"auth provider {provider}", reqs
     )
@@ -169,22 +206,21 @@ async def load_auth_provider_module(
     return module
 
 
-class LoginFlow(data_entry_flow.FlowHandler):
+class LoginFlow[_AuthProviderT: AuthProvider = AuthProvider](
+    FlowHandler[AuthFlowContext, AuthFlowResult, tuple[str, str]],
+):
     """Handler for the login flow."""
 
-    def __init__(self, auth_provider: AuthProvider) -> None:
+    _flow_result = AuthFlowResult
+
+    def __init__(self, auth_provider: _AuthProviderT) -> None:
         """Initialize the login flow."""
         self._auth_provider = auth_provider
-        self._auth_module_id: Optional[str] = None
-        self._auth_manager = auth_provider.hass.auth  # type: ignore
-        self.available_mfa_modules: Dict[str, str] = {}
-        self.created_at = dt_util.utcnow()
-        self.invalid_mfa_times = 0
-        self.user: Optional[User] = None
+        self._auth_manager = auth_provider.hass.auth
 
     async def async_step_init(
-        self, user_input: Optional[Dict[str, str]] = None
-    ) -> Dict[str, Any]:
+        self, user_input: dict[str, str] | None = None
+    ) -> AuthFlowResult:
         """Handle the first step of login flow.
 
         Return self.async_show_form(step_id='init') if user_input is None.
@@ -192,9 +228,48 @@ class LoginFlow(data_entry_flow.FlowHandler):
         """
         raise NotImplementedError
 
+    async def async_finish(self, flow_result: Any) -> AuthFlowResult:
+        """Handle the pass of login flow."""
+        return self.async_create_entry(data=flow_result)
+
+
+class MfaLoginFlow[_AuthProviderT: AuthProvider = AuthProvider](
+    LoginFlow[_AuthProviderT]
+):
+    """Login flow that asks for a user's enabled multi-factor auth module."""
+
+    def __init__(self, auth_provider: _AuthProviderT) -> None:
+        """Initialize the login flow."""
+        super().__init__(auth_provider)
+        self._auth_module_id: str | None = None
+        self.available_mfa_modules: dict[str, str] = {}
+        self.created_at = dt_util.utcnow()
+        self.invalid_mfa_times = 0
+        self.user: User | None = None
+        self.credential: Credentials | None = None
+
+    @override
+    async def async_finish(self, flow_result: Any) -> AuthFlowResult:
+        """Ask for a second factor before finishing, if the user enabled one."""
+        credentials = await self._auth_provider.async_get_or_create_credentials(
+            flow_result
+        )
+
+        # New credentials are not linked to a user that could have enabled MFA
+        if not credentials.is_new and (
+            user := await self._auth_manager.async_get_user_by_credentials(credentials)
+        ):
+            if modules := await self._auth_manager.async_get_enabled_mfa(user):
+                self.credential = credentials
+                self.user = user
+                self.available_mfa_modules = modules
+                return await self.async_step_select_mfa_module()
+
+        return await super().async_finish(credentials)
+
     async def async_step_select_mfa_module(
-        self, user_input: Optional[Dict[str, str]] = None
-    ) -> Dict[str, Any]:
+        self, user_input: dict[str, str] | None = None
+    ) -> AuthFlowResult:
         """Handle the step of select mfa module."""
         errors = {}
 
@@ -206,25 +281,27 @@ class LoginFlow(data_entry_flow.FlowHandler):
             errors["base"] = "invalid_auth_module"
 
         if len(self.available_mfa_modules) == 1:
-            self._auth_module_id = list(self.available_mfa_modules.keys())[0]
+            self._auth_module_id = list(self.available_mfa_modules)[0]
             return await self.async_step_mfa()
 
         return self.async_show_form(
             step_id="select_mfa_module",
-            data_schema=vol.Schema(
-                {"multi_factor_auth_module": vol.In(self.available_mfa_modules)}
+            data_schema=probatio.Schema(
+                {"multi_factor_auth_module": probatio.In(self.available_mfa_modules)}
             ),
             errors=errors,
         )
 
     async def async_step_mfa(
-        self, user_input: Optional[Dict[str, str]] = None
-    ) -> Dict[str, Any]:
+        self, user_input: dict[str, str] | None = None
+    ) -> AuthFlowResult:
         """Handle the step of mfa validation."""
+        assert self.credential
         assert self.user
 
         errors = {}
 
+        assert self._auth_module_id is not None
         auth_module = self._auth_manager.get_auth_mfa_module(self._auth_module_id)
         if auth_module is None:
             # Given an invalid input to async_step_select_mfa_module
@@ -253,9 +330,9 @@ class LoginFlow(data_entry_flow.FlowHandler):
                     return self.async_abort(reason="too_many_retry")
 
             if not errors:
-                return await self.async_finish(self.user)
+                return await super().async_finish(self.credential)
 
-        description_placeholders: Dict[str, Optional[str]] = {
+        description_placeholders: dict[str, str] = {
             "mfa_module_name": auth_module.name,
             "mfa_module_id": auth_module.id,
         }
@@ -266,7 +343,3 @@ class LoginFlow(data_entry_flow.FlowHandler):
             description_placeholders=description_placeholders,
             errors=errors,
         )
-
-    async def async_finish(self, flow_result: Any) -> Dict:
-        """Handle the pass of login flow."""
-        return self.async_create_entry(title=self._auth_provider.name, data=flow_result)

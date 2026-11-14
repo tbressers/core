@@ -1,24 +1,46 @@
 {
-    "config": {
-        "title": "Certificate Expiry",
-        "step": {
-            "user": {
-                "title": "Define the certificate to test",
-                "data": {
-                    "name": "The name of the certificate",
-                    "host": "The hostname of the certificate",
-                    "port": "The port of the certificate"
-                }
-            }
+  "config": {
+    "abort": {
+      "already_configured": "[%key:common::config_flow::abort::already_configured_service%]"
+    },
+    "error": {
+      "connection_refused": "Connection refused when connecting to host",
+      "connection_reset": "Connection reset when connecting to host",
+      "connection_timeout": "Timeout when connecting to this host",
+      "resolve_failed": "This host cannot be resolved"
+    },
+    "step": {
+      "reconfigure": {
+        "data": {
+          "host": "[%key:common::config_flow::data::host%]",
+          "port": "[%key:common::config_flow::data::port%]"
         },
-        "error": {
-            "resolve_failed": "This host can not be resolved",
-            "connection_timeout": "Timeout when connecting to this host",
-            "connection_refused": "Connection refused when connecting to host"
+        "data_description": {
+          "host": "The hostname or IP address of the server to monitor.",
+          "port": "The port to connect to on the server."
         },
-        "abort": {
-            "already_configured": "This host and port combination is already configured",
-            "import_failed": "Import from config failed"
-        }
+        "title": "Reconfigure the certificate to test"
+      },
+      "user": {
+        "data": {
+          "host": "[%key:common::config_flow::data::host%]",
+          "name": "The name of the certificate",
+          "port": "[%key:common::config_flow::data::port%]"
+        },
+        "data_description": {
+          "host": "The hostname or IP address of the server to monitor.",
+          "port": "The port to connect to on the server."
+        },
+        "title": "Define the certificate to test"
+      }
     }
+  },
+  "entity": {
+    "sensor": {
+      "certificate_expiry": {
+        "name": "Cert expiry"
+      }
+    }
+  },
+  "title": "Certificate Expiry"
 }

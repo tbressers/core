@@ -1,53 +1,59 @@
 """Support for Aqualink temperature sensors."""
-import logging
-from typing import Optional
 
-from homeassistant.components.sensor import DOMAIN
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import DEVICE_CLASS_TEMPERATURE, TEMP_CELSIUS, TEMP_FAHRENHEIT
-from homeassistant.helpers.typing import HomeAssistantType
+from typing import override
 
-from . import AqualinkEntity
-from .const import DOMAIN as AQUALINK_DOMAIN
+from iaqualink.device import AqualinkSensor
 
-_LOGGER = logging.getLogger(__name__)
+from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
+from homeassistant.const import UnitOfTemperature
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+
+from . import AqualinkConfigEntry
+from .coordinator import AqualinkDataUpdateCoordinator
+from .entity import AqualinkEntity
 
 PARALLEL_UPDATES = 0
 
 
 async def async_setup_entry(
-    hass: HomeAssistantType, config_entry: ConfigEntry, async_add_entities
+    hass: HomeAssistant,
+    config_entry: AqualinkConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up discovered sensors."""
-    devs = []
-    for dev in hass.data[AQUALINK_DOMAIN][DOMAIN]:
-        devs.append(HassAqualinkSensor(dev))
-    async_add_entities(devs, True)
+    async_add_entities(
+        HassAqualinkSensor(
+            config_entry.runtime_data.coordinators[dev.system.serial], dev
+        )
+        for dev in config_entry.runtime_data.sensors
+    )
 
 
-class HassAqualinkSensor(AqualinkEntity):
+class HassAqualinkSensor(AqualinkEntity[AqualinkSensor], SensorEntity):
     """Representation of a sensor."""
 
-    @property
-    def name(self) -> str:
-        """Return the name of the sensor."""
-        return self.dev.label
+    def __init__(
+        self, coordinator: AqualinkDataUpdateCoordinator, dev: AqualinkSensor
+    ) -> None:
+        """Initialize AquaLink sensor."""
+        super().__init__(coordinator, dev)
+        if not dev.name.endswith("_temp"):
+            return
+        self._attr_device_class = SensorDeviceClass.TEMPERATURE
+        if dev.system.temp_unit == "F":
+            self._attr_native_unit_of_measurement = UnitOfTemperature.FAHRENHEIT
+            return
+        self._attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
 
     @property
-    def unit_of_measurement(self) -> str:
-        """Return the measurement unit for the sensor."""
-        if self.dev.system.temp_unit == "F":
-            return TEMP_FAHRENHEIT
-        return TEMP_CELSIUS
-
-    @property
-    def state(self) -> str:
+    @override
+    def native_value(self) -> int | float | None:
         """Return the state of the sensor."""
-        return int(self.dev.state) if self.dev.state != "" else None
+        if self.dev.state == "":
+            return None
 
-    @property
-    def device_class(self) -> Optional[str]:
-        """Return the class of the sensor."""
-        if self.dev.name.endswith("_temp"):
-            return DEVICE_CLASS_TEMPERATURE
-        return None
+        try:
+            return int(self.dev.state)
+        except ValueError:
+            return float(self.dev.state)

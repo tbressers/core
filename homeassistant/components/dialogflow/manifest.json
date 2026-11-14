@@ -1,9 +1,11 @@
 {
   "domain": "dialogflow",
   "name": "Dialogflow",
+  "categories": ["ai_voice.voice_assistants"],
+  "codeowners": [],
   "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/dialogflow",
-  "requirements": [],
+  "connectivity": ["cloud"],
   "dependencies": ["webhook"],
-  "codeowners": []
+  "documentation": "https://www.home-assistant.io/integrations/dialogflow",
+  "iot_class": "cloud_push"
 }

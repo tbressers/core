@@ -1,394 +1,129 @@
 """Support for ONVIF Cameras with FFmpeg as decoder."""
+
 import asyncio
-import datetime as dt
-import logging
-import os
-from typing import Optional
+from typing import override
 
-from aiohttp.client_exceptions import ClientConnectionError, ServerDisconnectedError
 from haffmpeg.camera import CameraMjpeg
-from haffmpeg.tools import IMAGE_JPEG, ImageFrame
-import onvif
-from onvif import ONVIFCamera, exceptions
-import voluptuous as vol
-from zeep.asyncio import AsyncTransport
-from zeep.exceptions import Fault
+from onvif.exceptions import ONVIFError
+from yarl import URL
 
-from homeassistant.components.camera import PLATFORM_SCHEMA, SUPPORT_STREAM, Camera
-from homeassistant.components.camera.const import DOMAIN
-from homeassistant.components.ffmpeg import CONF_EXTRA_ARGUMENTS, DATA_FFMPEG
-from homeassistant.const import (
-    ATTR_ENTITY_ID,
-    CONF_HOST,
-    CONF_NAME,
-    CONF_PASSWORD,
-    CONF_PORT,
-    CONF_USERNAME,
+from homeassistant.components import ffmpeg
+from homeassistant.components.camera import Camera, CameraEntityFeature
+from homeassistant.components.ffmpeg import CONF_EXTRA_ARGUMENTS, get_ffmpeg_manager
+from homeassistant.components.stream import (
+    CONF_RTSP_TRANSPORT,
+    CONF_USE_WALLCLOCK_AS_TIMESTAMPS,
+    RTSP_TRANSPORTS,
 )
-from homeassistant.exceptions import PlatformNotReady
-from homeassistant.helpers.aiohttp_client import (
-    async_aiohttp_proxy_stream,
-    async_get_clientsession,
-)
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.service import async_extract_entity_ids
-import homeassistant.util.dt as dt_util
+from homeassistant.const import HTTP_BASIC_AUTHENTICATION
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import async_aiohttp_proxy_stream
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-_LOGGER = logging.getLogger(__name__)
-
-DEFAULT_NAME = "ONVIF Camera"
-DEFAULT_PORT = 5000
-DEFAULT_USERNAME = "admin"
-DEFAULT_PASSWORD = "888888"
-DEFAULT_ARGUMENTS = "-pred 1"
-DEFAULT_PROFILE = 0
-
-CONF_PROFILE = "profile"
-
-ATTR_PAN = "pan"
-ATTR_TILT = "tilt"
-ATTR_ZOOM = "zoom"
-
-DIR_UP = "UP"
-DIR_DOWN = "DOWN"
-DIR_LEFT = "LEFT"
-DIR_RIGHT = "RIGHT"
-ZOOM_OUT = "ZOOM_OUT"
-ZOOM_IN = "ZOOM_IN"
-PTZ_NONE = "NONE"
-
-SERVICE_PTZ = "onvif_ptz"
-
-ONVIF_DATA = "onvif"
-ENTITIES = "entities"
-
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {
-        vol.Required(CONF_HOST): cv.string,
-        vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
-        vol.Optional(CONF_PASSWORD, default=DEFAULT_PASSWORD): cv.string,
-        vol.Optional(CONF_USERNAME, default=DEFAULT_USERNAME): cv.string,
-        vol.Optional(CONF_PORT, default=DEFAULT_PORT): cv.port,
-        vol.Optional(CONF_EXTRA_ARGUMENTS, default=DEFAULT_ARGUMENTS): cv.string,
-        vol.Optional(CONF_PROFILE, default=DEFAULT_PROFILE): vol.All(
-            vol.Coerce(int), vol.Range(min=0)
-        ),
-    }
-)
-
-SERVICE_PTZ_SCHEMA = vol.Schema(
-    {
-        ATTR_ENTITY_ID: cv.entity_ids,
-        ATTR_PAN: vol.In([DIR_LEFT, DIR_RIGHT, PTZ_NONE]),
-        ATTR_TILT: vol.In([DIR_UP, DIR_DOWN, PTZ_NONE]),
-        ATTR_ZOOM: vol.In([ZOOM_OUT, ZOOM_IN, PTZ_NONE]),
-    }
-)
+from .const import CONF_SNAPSHOT_AUTH, LOGGER
+from .device import ONVIFConfigEntry, ONVIFDevice
+from .entity import ONVIFBaseEntity
+from .models import Profile
 
 
-async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
-    """Set up a ONVIF camera."""
-    _LOGGER.debug("Setting up the ONVIF camera platform")
-
-    async def async_handle_ptz(service):
-        """Handle PTZ service call."""
-        pan = service.data.get(ATTR_PAN, None)
-        tilt = service.data.get(ATTR_TILT, None)
-        zoom = service.data.get(ATTR_ZOOM, None)
-        all_cameras = hass.data[ONVIF_DATA][ENTITIES]
-        entity_ids = await async_extract_entity_ids(hass, service)
-        target_cameras = []
-        if not entity_ids:
-            target_cameras = all_cameras
-        else:
-            target_cameras = [
-                camera for camera in all_cameras if camera.entity_id in entity_ids
-            ]
-        for camera in target_cameras:
-            await camera.async_perform_ptz(pan, tilt, zoom)
-
-    hass.services.async_register(
-        DOMAIN, SERVICE_PTZ, async_handle_ptz, schema=SERVICE_PTZ_SCHEMA
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: ONVIFConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up the ONVIF camera video stream."""
+    device = config_entry.runtime_data
+    async_add_entities(
+        [ONVIFCameraEntity(device, profile) for profile in device.profiles]
     )
 
-    _LOGGER.debug("Constructing the ONVIFHassCamera")
 
-    hass_camera = ONVIFHassCamera(hass, config)
+class ONVIFCameraEntity(ONVIFBaseEntity, Camera):
+    """Representation of an ONVIF camera."""
 
-    await hass_camera.async_initialize()
+    _attr_supported_features = CameraEntityFeature.STREAM
 
-    async_add_entities([hass_camera])
-    return
-
-
-class ONVIFHassCamera(Camera):
-    """An implementation of an ONVIF camera."""
-
-    def __init__(self, hass, config):
-        """Initialize an ONVIF camera."""
-        super().__init__()
-
-        _LOGGER.debug("Importing dependencies")
-
-        _LOGGER.debug("Setting up the ONVIF camera component")
-
-        self._username = config.get(CONF_USERNAME)
-        self._password = config.get(CONF_PASSWORD)
-        self._host = config.get(CONF_HOST)
-        self._port = config.get(CONF_PORT)
-        self._name = config.get(CONF_NAME)
-        self._ffmpeg_arguments = config.get(CONF_EXTRA_ARGUMENTS)
-        self._profile_index = config.get(CONF_PROFILE)
-        self._ptz_service = None
-        self._input = None
-        self._mac = None
-
-        _LOGGER.debug(
-            "Setting up the ONVIF camera device @ '%s:%s'", self._host, self._port
+    def __init__(self, device: ONVIFDevice, profile: Profile) -> None:
+        """Initialize ONVIF camera entity."""
+        ONVIFBaseEntity.__init__(self, device)
+        Camera.__init__(self)
+        self.profile = profile
+        self.stream_options[CONF_RTSP_TRANSPORT] = device.config_entry.options.get(
+            CONF_RTSP_TRANSPORT, next(iter(RTSP_TRANSPORTS))
         )
-
-        session = async_get_clientsession(hass)
-        transport = AsyncTransport(None, session=session)
-        self._camera = ONVIFCamera(
-            self._host,
-            self._port,
-            self._username,
-            self._password,
-            "{}/wsdl/".format(os.path.dirname(onvif.__file__)),
-            transport=transport,
+        self.stream_options[CONF_USE_WALLCLOCK_AS_TIMESTAMPS] = (
+            device.config_entry.options.get(CONF_USE_WALLCLOCK_AS_TIMESTAMPS, False)
         )
-
-    async def async_initialize(self):
-        """
-        Initialize the camera.
-
-        Initializes the camera by obtaining the input uri and connecting to
-        the camera. Also retrieves the ONVIF profiles.
-        """
-        try:
-            _LOGGER.debug("Updating service addresses")
-            await self._camera.update_xaddrs()
-
-            await self.async_obtain_mac_address()
-            await self.async_check_date_and_time()
-            await self.async_obtain_input_uri()
-            self.setup_ptz()
-        except ClientConnectionError as err:
-            _LOGGER.warning(
-                "Couldn't connect to camera '%s', but will retry later. Error: %s",
-                self._name,
-                err,
-            )
-            raise PlatformNotReady
-        except Fault as err:
-            _LOGGER.error(
-                "Couldn't connect to camera '%s', please verify "
-                "that the credentials are correct. Error: %s",
-                self._name,
-                err,
-            )
-
-    async def async_obtain_mac_address(self):
-        """Obtain the MAC address of the camera to use as the unique ID."""
-        devicemgmt = self._camera.create_devicemgmt_service()
-        network_interfaces = await devicemgmt.GetNetworkInterfaces()
-        for interface in network_interfaces:
-            if interface.Enabled:
-                self._mac = interface.Info.HwAddress
-
-    async def async_check_date_and_time(self):
-        """Warns if camera and system date not synced."""
-        _LOGGER.debug("Setting up the ONVIF device management service")
-        devicemgmt = self._camera.create_devicemgmt_service()
-
-        _LOGGER.debug("Retrieving current camera date/time")
-        try:
-            system_date = dt_util.utcnow()
-            device_time = await devicemgmt.GetSystemDateAndTime()
-            if not device_time:
-                _LOGGER.debug(
-                    """Couldn't get camera '%s' date/time.
-                    GetSystemDateAndTime() return null/empty""",
-                    self._name,
-                )
-                return
-
-            if device_time.UTCDateTime:
-                tzone = dt_util.UTC
-                cdate = device_time.UTCDateTime
-            else:
-                tzone = (
-                    dt_util.get_time_zone(device_time.TimeZone)
-                    or dt_util.DEFAULT_TIME_ZONE
-                )
-                cdate = device_time.LocalDateTime
-
-            if cdate is None:
-                _LOGGER.warning("Could not retrieve date/time on this camera")
-            else:
-                cam_date = dt.datetime(
-                    cdate.Date.Year,
-                    cdate.Date.Month,
-                    cdate.Date.Day,
-                    cdate.Time.Hour,
-                    cdate.Time.Minute,
-                    cdate.Time.Second,
-                    0,
-                    tzone,
-                )
-
-                cam_date_utc = cam_date.astimezone(dt_util.UTC)
-
-                _LOGGER.debug("TimeZone for date/time: %s", tzone)
-
-                _LOGGER.debug("Camera date/time: %s", cam_date)
-
-                _LOGGER.debug("Camera date/time in UTC: %s", cam_date_utc)
-
-                _LOGGER.debug("System date/time: %s", system_date)
-
-                dt_diff = cam_date - system_date
-                dt_diff_seconds = dt_diff.total_seconds()
-
-                if dt_diff_seconds > 5:
-                    _LOGGER.warning(
-                        "The date/time on the camera (UTC) is '%s', "
-                        "which is different from the system '%s', "
-                        "this could lead to authentication issues",
-                        cam_date_utc,
-                        system_date,
-                    )
-        except ServerDisconnectedError as err:
-            _LOGGER.warning(
-                "Couldn't get camera '%s' date/time. Error: %s", self._name, err
-            )
-
-    async def async_obtain_input_uri(self):
-        """Set the input uri for the camera."""
-        _LOGGER.debug(
-            "Connecting with ONVIF Camera: %s on port %s", self._host, self._port
+        self._basic_auth = (
+            device.config_entry.data.get(CONF_SNAPSHOT_AUTH)
+            == HTTP_BASIC_AUTHENTICATION
         )
+        self._stream_uri: str | None = None
+        self._stream_uri_future: asyncio.Future[str] | None = None
+        self._attr_entity_registry_enabled_default = (
+            device.max_resolution == profile.video.resolution.width
+        )
+        self._attr_unique_id = f"{self.mac_or_serial}#{profile.token}"
+        self._attr_name = f"{device.name} {profile.name}"
 
-        try:
-            _LOGGER.debug("Retrieving profiles")
+    @property
+    @override
+    def use_stream_for_stills(self) -> bool:
+        """Whether or not to use stream to generate stills."""
+        return bool(self.stream and self.stream.dynamic_stream_settings.preload_stream)
 
-            media_service = self._camera.create_media_service()
+    @override
+    async def stream_source(self):
+        """Return the stream source."""
+        return await self._async_get_stream_uri()
 
-            profiles = await media_service.GetProfiles()
-
-            _LOGGER.debug("Retrieved '%d' profiles", len(profiles))
-
-            if self._profile_index >= len(profiles):
-                _LOGGER.warning(
-                    "ONVIF Camera '%s' doesn't provide profile %d."
-                    " Using the last profile.",
-                    self._name,
-                    self._profile_index,
-                )
-                self._profile_index = -1
-
-            _LOGGER.debug("Using profile index '%d'", self._profile_index)
-
-            _LOGGER.debug("Retrieving stream uri")
-
-            # Fix Onvif setup error on Goke GK7102 based IP camera
-            # where we need to recreate media_service  #26781
-            media_service = self._camera.create_media_service()
-
-            req = media_service.create_type("GetStreamUri")
-            req.ProfileToken = profiles[self._profile_index].token
-            req.StreamSetup = {
-                "Stream": "RTP-Unicast",
-                "Transport": {"Protocol": "RTSP"},
-            }
-
-            stream_uri = await media_service.GetStreamUri(req)
-            uri_no_auth = stream_uri.Uri
-            uri_for_log = uri_no_auth.replace("rtsp://", "rtsp://<user>:<password>@", 1)
-            self._input = uri_no_auth.replace(
-                "rtsp://", f"rtsp://{self._username}:{self._password}@", 1
-            )
-
-            _LOGGER.debug(
-                "ONVIF Camera Using the following URL for %s: %s",
-                self._name,
-                uri_for_log,
-            )
-        except exceptions.ONVIFError as err:
-            _LOGGER.error("Couldn't setup camera '%s'. Error: %s", self._name, err)
-
-    def setup_ptz(self):
-        """Set up PTZ if available."""
-        _LOGGER.debug("Setting up the ONVIF PTZ service")
-        if self._camera.get_service("ptz", create=False) is None:
-            _LOGGER.debug("PTZ is not available")
-        else:
-            self._ptz_service = self._camera.create_ptz_service()
-            _LOGGER.debug("Completed set up of the ONVIF camera component")
-
-    async def async_perform_ptz(self, pan, tilt, zoom):
-        """Perform a PTZ action on the camera."""
-        if self._ptz_service is None:
-            _LOGGER.warning("PTZ actions are not supported on camera '%s'", self._name)
-            return
-
-        if self._ptz_service:
-            pan_val = 1 if pan == DIR_RIGHT else -1 if pan == DIR_LEFT else 0
-            tilt_val = 1 if tilt == DIR_UP else -1 if tilt == DIR_DOWN else 0
-            zoom_val = 1 if zoom == ZOOM_IN else -1 if zoom == ZOOM_OUT else 0
-            req = {
-                "Velocity": {
-                    "PanTilt": {"_x": pan_val, "_y": tilt_val},
-                    "Zoom": {"_x": zoom_val},
-                }
-            }
-            try:
-                _LOGGER.debug(
-                    "Calling PTZ | Pan = %d | Tilt = %d | Zoom = %d",
-                    pan_val,
-                    tilt_val,
-                    zoom_val,
-                )
-
-                await self._ptz_service.ContinuousMove(req)
-            except exceptions.ONVIFError as err:
-                if "Bad Request" in err.reason:
-                    self._ptz_service = None
-                    _LOGGER.debug("Camera '%s' doesn't support PTZ.", self._name)
-        else:
-            _LOGGER.debug("Camera '%s' doesn't support PTZ.", self._name)
-
-    async def async_added_to_hass(self):
-        """Handle entity addition to hass."""
-        _LOGGER.debug("Camera '%s' added to hass", self._name)
-
-        if ONVIF_DATA not in self.hass.data:
-            self.hass.data[ONVIF_DATA] = {}
-            self.hass.data[ONVIF_DATA][ENTITIES] = []
-        self.hass.data[ONVIF_DATA][ENTITIES].append(self)
-
-    async def async_camera_image(self):
+    @override
+    async def async_camera_image(
+        self, width: int | None = None, height: int | None = None
+    ) -> bytes | None:
         """Return a still image response from the camera."""
 
-        _LOGGER.debug("Retrieving image from camera '%s'", self._name)
+        if self.device.capabilities.snapshot:
+            try:
+                if image := await self.device.device.get_snapshot(
+                    self.profile.token, self._basic_auth
+                ):
+                    return image
+            # pylint: disable-next=home-assistant-action-swallowed-exception
+            except ONVIFError as err:
+                LOGGER.error(
+                    "Fetch snapshot image failed from %s, falling back to FFmpeg; %s",
+                    self.device.name,
+                    err,
+                )
+            else:
+                LOGGER.error(
+                    "Fetch snapshot image failed from %s, falling back to FFmpeg",
+                    self.device.name,
+                )
 
-        ffmpeg = ImageFrame(self.hass.data[DATA_FFMPEG].binary, loop=self.hass.loop)
-
-        image = await asyncio.shield(
-            ffmpeg.get_image(
-                self._input, output_format=IMAGE_JPEG, extra_cmd=self._ffmpeg_arguments
-            )
+        stream_uri = await self._async_get_stream_uri()
+        return await ffmpeg.async_get_image(
+            self.hass,
+            stream_uri,
+            extra_cmd=self.device.config_entry.options.get(CONF_EXTRA_ARGUMENTS),
+            width=width,
+            height=height,
         )
-        return image
 
+    @override
     async def handle_async_mjpeg_stream(self, request):
         """Generate an HTTP MJPEG stream from the camera."""
-        _LOGGER.debug("Handling mjpeg stream from camera '%s'", self._name)
+        LOGGER.debug("Handling mjpeg stream from camera '%s'", self.device.name)
 
-        ffmpeg_manager = self.hass.data[DATA_FFMPEG]
-        stream = CameraMjpeg(ffmpeg_manager.binary, loop=self.hass.loop)
+        ffmpeg_manager = get_ffmpeg_manager(self.hass)
+        stream = CameraMjpeg(ffmpeg_manager.binary)
+        stream_uri = await self._async_get_stream_uri()
 
-        await stream.open_camera(self._input, extra_cmd=self._ffmpeg_arguments)
+        await stream.open_camera(
+            stream_uri,
+            extra_cmd=self.device.config_entry.options.get(CONF_EXTRA_ARGUMENTS),
+        )
 
         try:
             stream_reader = await stream.get_reader()
@@ -401,23 +136,48 @@ class ONVIFHassCamera(Camera):
         finally:
             await stream.close()
 
-    @property
-    def supported_features(self):
-        """Return supported features."""
-        if self._input:
-            return SUPPORT_STREAM
-        return 0
+    async def _async_get_stream_uri(self) -> str:
+        """Return the stream URI."""
+        if self._stream_uri:
+            return self._stream_uri
+        if self._stream_uri_future:
+            return await self._stream_uri_future
+        loop = asyncio.get_running_loop()
+        self._stream_uri_future = loop.create_future()
+        try:
+            uri_no_auth = await self.device.async_get_stream_uri(self.profile)
+        except (TimeoutError, Exception) as err:
+            LOGGER.error("Failed to get stream uri: %s", err)
+            if self._stream_uri_future:
+                self._stream_uri_future.set_exception(err)
+            raise
+        url = URL(uri_no_auth)
+        url = url.with_user(self.device.username)
+        url = url.with_password(self.device.password)
+        self._stream_uri = str(url)
+        self._stream_uri_future.set_result(self._stream_uri)
+        return self._stream_uri
 
-    async def stream_source(self):
-        """Return the stream source."""
-        return self._input
-
-    @property
-    def name(self):
-        """Return the name of this camera."""
-        return self._name
-
-    @property
-    def unique_id(self) -> Optional[str]:
-        """Return a unique ID."""
-        return self._mac
+    async def async_perform_ptz(
+        self,
+        distance,
+        move_mode,
+        continuous_duration,
+        preset,
+        speed=None,
+        pan=None,
+        tilt=None,
+        zoom=None,
+    ) -> None:
+        """Perform a PTZ action on the camera."""
+        await self.device.async_perform_ptz(
+            self.profile,
+            distance,
+            speed,
+            move_mode,
+            continuous_duration,
+            preset,
+            pan,
+            tilt,
+            zoom,
+        )

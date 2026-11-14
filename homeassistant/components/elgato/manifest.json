@@ -1,11 +1,19 @@
 {
   "domain": "elgato",
-  "name": "Elgato Key Light",
-  "config_flow": true,
-  "documentation": "https://www.home-assistant.io/integrations/elgato",
-  "requirements": ["elgato==0.2.0"],
-  "dependencies": [],
-  "zeroconf": ["_elg._tcp.local."],
+  "name": "Elgato Light",
+  "categories": ["lighting.bulbs_lamps"],
   "codeowners": ["@frenck"],
-  "quality_scale": "platinum"
+  "config_flow": true,
+  "connectivity": ["network"],
+  "dhcp": [
+    {
+      "registered_devices": true
+    }
+  ],
+  "documentation": "https://www.home-assistant.io/integrations/elgato",
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "quality_scale": "platinum",
+  "requirements": ["elgato==6.1.1"],
+  "zeroconf": ["_elg._tcp.local."]
 }

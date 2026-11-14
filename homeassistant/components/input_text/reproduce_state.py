@@ -1,25 +1,28 @@
 """Reproduce an Input text state."""
+
 import asyncio
+from collections.abc import Iterable
 import logging
-from typing import Iterable, Optional
+from typing import Any
 
 from homeassistant.const import ATTR_ENTITY_ID
-from homeassistant.core import Context, State
-from homeassistant.helpers.typing import HomeAssistantType
+from homeassistant.core import Context, HomeAssistant, State
 
-from . import ATTR_VALUE, DOMAIN, SERVICE_SET_VALUE
+from .const import DOMAIN, InputTextService, InputTextServiceArgument
 
 _LOGGER = logging.getLogger(__name__)
 
 
 async def _async_reproduce_state(
-    hass: HomeAssistantType, state: State, context: Optional[Context] = None
+    hass: HomeAssistant,
+    state: State,
+    *,
+    context: Context | None = None,
+    reproduce_options: dict[str, Any] | None = None,
 ) -> None:
     """Reproduce a single state."""
-    cur_state = hass.states.get(state.entity_id)
-
     # Return if we can't find the entity
-    if cur_state is None:
+    if (cur_state := hass.states.get(state.entity_id)) is None:
         _LOGGER.warning("Unable to find entity %s", state.entity_id)
         return
 
@@ -28,8 +31,11 @@ async def _async_reproduce_state(
         return
 
     # Call service
-    service = SERVICE_SET_VALUE
-    service_data = {ATTR_ENTITY_ID: state.entity_id, ATTR_VALUE: state.state}
+    service = InputTextService.SET_VALUE
+    service_data = {
+        ATTR_ENTITY_ID: state.entity_id,
+        InputTextServiceArgument.VALUE: state.state,
+    }
 
     await hass.services.async_call(
         DOMAIN, service, service_data, context=context, blocking=True
@@ -37,10 +43,19 @@ async def _async_reproduce_state(
 
 
 async def async_reproduce_states(
-    hass: HomeAssistantType, states: Iterable[State], context: Optional[Context] = None
+    hass: HomeAssistant,
+    states: Iterable[State],
+    *,
+    context: Context | None = None,
+    reproduce_options: dict[str, Any] | None = None,
 ) -> None:
     """Reproduce Input text states."""
     # Reproduce states in parallel.
     await asyncio.gather(
-        *(_async_reproduce_state(hass, state, context) for state in states)
+        *(
+            _async_reproduce_state(
+                hass, state, context=context, reproduce_options=reproduce_options
+            )
+            for state in states
+        )
     )

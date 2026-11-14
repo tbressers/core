@@ -1,9 +1,13 @@
 {
   "domain": "ipma",
-  "name": "Instituto Português do Mar e Atmosfera (IPMA)",
+  "name": "Instituto Portugu\u00eas do Mar e Atmosfera (IPMA)",
+  "categories": ["weather_alerts.forecasts"],
+  "codeowners": ["@dgomes"],
   "config_flow": true,
+  "connectivity": ["cloud"],
   "documentation": "https://www.home-assistant.io/integrations/ipma",
-  "requirements": ["pyipma==2.0.5"],
-  "dependencies": [],
-  "codeowners": ["@dgomes", "@abmantis"]
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
+  "loggers": ["geopy", "pyipma"],
+  "requirements": ["pyipma==3.0.10"]
 }

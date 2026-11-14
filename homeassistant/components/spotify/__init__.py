@@ -1,97 +1,89 @@
 """The spotify integration."""
 
-from spotipy import Spotify, SpotifyException
-import voluptuous as vol
+from typing import TYPE_CHECKING
 
-from homeassistant.components.media_player import DOMAIN as MEDIA_PLAYER_DOMAIN
-from homeassistant.components.spotify import config_flow
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import ATTR_CREDENTIALS
+import aiohttp
+from spotifyaio import SpotifyClient
+
+from homeassistant.const import CONF_ACCESS_TOKEN, Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.helpers import config_entry_oauth2_flow, config_validation as cv
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.config_entry_oauth2_flow import (
     OAuth2Session,
     async_get_config_entry_implementation,
 )
-from homeassistant.helpers.typing import ConfigType
 
-from .const import (
-    CONF_CLIENT_ID,
-    CONF_CLIENT_SECRET,
-    DATA_SPOTIFY_CLIENT,
-    DATA_SPOTIFY_ME,
-    DATA_SPOTIFY_SESSION,
-    DOMAIN,
+from .browse_media import async_browse_media
+from .const import DOMAIN, SPOTIFY_SCOPES
+from .coordinator import (
+    SpotifyConfigEntry,
+    SpotifyCoordinator,
+    SpotifyData,
+    SpotifyDeviceCoordinator,
+)
+from .util import (
+    is_spotify_media_type,
+    resolve_spotify_media_type,
+    spotify_uri_from_media_browser_url,
 )
 
-CONFIG_SCHEMA = vol.Schema(
-    {
-        DOMAIN: vol.Schema(
-            {
-                vol.Inclusive(CONF_CLIENT_ID, ATTR_CREDENTIALS): cv.string,
-                vol.Inclusive(CONF_CLIENT_SECRET, ATTR_CREDENTIALS): cv.string,
-            }
-        )
-    },
-    extra=vol.ALLOW_EXTRA,
-)
+PLATFORMS = [Platform.MEDIA_PLAYER]
+
+__all__ = [
+    "DOMAIN",
+    "async_browse_media",
+    "is_spotify_media_type",
+    "resolve_spotify_media_type",
+    "spotify_uri_from_media_browser_url",
+]
 
 
-async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Set up the Spotify integration."""
-    if DOMAIN not in config:
-        return True
-
-    if CONF_CLIENT_ID in config[DOMAIN]:
-        config_flow.SpotifyFlowHandler.async_register_implementation(
-            hass,
-            config_entry_oauth2_flow.LocalOAuth2Implementation(
-                hass,
-                DOMAIN,
-                config[DOMAIN][CONF_CLIENT_ID],
-                config[DOMAIN][CONF_CLIENT_SECRET],
-                "https://accounts.spotify.com/authorize",
-                "https://accounts.spotify.com/api/token",
-            ),
-        )
-
-    return True
-
-
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: SpotifyConfigEntry) -> None:
     """Set up Spotify from a config entry."""
     implementation = await async_get_config_entry_implementation(hass, entry)
     session = OAuth2Session(hass, entry, implementation)
-    await session.async_ensure_token_valid()
-    spotify = Spotify(auth=session.token["access_token"])
 
     try:
-        current_user = await hass.async_add_executor_job(spotify.me)
-    except SpotifyException:
-        raise ConfigEntryNotReady
+        await session.async_ensure_token_valid()
+    except aiohttp.ClientError as err:
+        raise ConfigEntryNotReady(
+            translation_domain=DOMAIN,
+            translation_key="token_refresh_failed",
+            translation_placeholders={"error": str(err)},
+        ) from err
 
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = {
-        DATA_SPOTIFY_CLIENT: spotify,
-        DATA_SPOTIFY_ME: current_user,
-        DATA_SPOTIFY_SESSION: session,
-    }
+    spotify = SpotifyClient(async_get_clientsession(hass))
 
-    hass.async_create_task(
-        hass.config_entries.async_forward_entry_setup(entry, MEDIA_PLAYER_DOMAIN)
-    )
-    return True
+    spotify.authenticate(session.token[CONF_ACCESS_TOKEN])
+
+    async def _refresh_token() -> str:
+        await session.async_ensure_token_valid()
+        token = session.token[CONF_ACCESS_TOKEN]
+        if TYPE_CHECKING:
+            assert isinstance(token, str)
+        return token
+
+    spotify.refresh_token_function = _refresh_token
+
+    coordinator = SpotifyCoordinator(hass, entry, spotify)
+
+    await coordinator.async_config_entry_first_refresh()
+
+    device_coordinator = SpotifyDeviceCoordinator(hass, entry, spotify)
+    await device_coordinator.async_config_entry_first_refresh()
+
+    entry.runtime_data = SpotifyData(coordinator, session, device_coordinator)
+
+    if not set(session.token["scope"].split(" ")).issuperset(SPOTIFY_SCOPES):
+        raise ConfigEntryAuthFailed(
+            translation_domain=DOMAIN,
+            translation_key="missing_scopes",
+        )
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: SpotifyConfigEntry) -> None:
     """Unload Spotify config entry."""
-    # Unload entities for this entry/device.
-    await hass.config_entries.async_forward_entry_unload(entry, MEDIA_PLAYER_DOMAIN)
-
-    # Cleanup
-    del hass.data[DOMAIN][entry.entry_id]
-    if not hass.data[DOMAIN]:
-        del hass.data[DOMAIN]
-
-    return True
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)

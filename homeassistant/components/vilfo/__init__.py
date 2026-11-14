@@ -1,5 +1,5 @@
 """The Vilfo Router integration."""
-import asyncio
+
 from datetime import timedelta
 import logging
 
@@ -7,28 +7,23 @@ from vilfo import Client as VilfoClient
 from vilfo.exceptions import VilfoException
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_ACCESS_TOKEN, CONF_HOST
+from homeassistant.const import CONF_ACCESS_TOKEN, CONF_HOST, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.helpers.typing import ConfigType, HomeAssistantType
 from homeassistant.util import Throttle
 
-from .const import ATTR_BOOT_TIME, ATTR_LOAD, DOMAIN, ROUTER_DEFAULT_HOST
+from .const import ATTR_BOOT_TIME, ATTR_LOAD, ROUTER_DEFAULT_HOST
 
-PLATFORMS = ["sensor"]
+type VilfoConfigEntry = ConfigEntry[VilfoRouterData]
+
+PLATFORMS = [Platform.SENSOR]
 
 DEFAULT_SCAN_INTERVAL = timedelta(seconds=30)
 
 _LOGGER = logging.getLogger(__name__)
 
 
-async def async_setup(hass: HomeAssistantType, config: ConfigType):
-    """Set up the Vilfo Router component."""
-    hass.data.setdefault(DOMAIN, {})
-    return True
-
-
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
+async def async_setup_entry(hass: HomeAssistant, entry: VilfoConfigEntry) -> None:
     """Set up Vilfo Router from a config entry."""
     host = entry.data[CONF_HOST]
     access_token = entry.data[CONF_ACCESS_TOKEN]
@@ -40,30 +35,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     if not vilfo_router.available:
         raise ConfigEntryNotReady
 
-    hass.data[DOMAIN][entry.entry_id] = vilfo_router
+    entry.runtime_data = vilfo_router
 
-    for platform in PLATFORMS:
-        hass.async_create_task(
-            hass.config_entries.async_forward_entry_setup(entry, platform)
-        )
-
-    return True
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
+async def async_unload_entry(hass: HomeAssistant, entry: VilfoConfigEntry) -> None:
     """Unload a config entry."""
-    unload_ok = all(
-        await asyncio.gather(
-            *[
-                hass.config_entries.async_forward_entry_unload(entry, platform)
-                for platform in PLATFORMS
-            ]
-        )
-    )
-    if unload_ok:
-        hass.data[DOMAIN].pop(entry.entry_id)
-
-    return unload_ok
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
 
 
 class VilfoRouterData:
@@ -121,5 +100,5 @@ class VilfoRouterData:
             return
 
         if self.available and self._unavailable_logged:
-            _LOGGER.info("Vilfo Router %s is available again", self.host)
+            _LOGGER.warning("Vilfo Router %s is available again", self.host)
             self._unavailable_logged = False

@@ -1,1 +1,1 @@
-"""The telegram component."""
+"""The Telegram component."""

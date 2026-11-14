@@ -1,135 +1,103 @@
 """Config flow for August integration."""
+
+from collections.abc import Mapping
 import logging
+from typing import Any, override
 
-from august.authenticator import ValidationResult
-import voluptuous as vol
+import jwt
 
-from homeassistant import config_entries, core
-from homeassistant.const import CONF_PASSWORD, CONF_TIMEOUT, CONF_USERNAME
-
-from .const import (
-    CONF_LOGIN_METHOD,
-    DEFAULT_TIMEOUT,
-    LOGIN_METHODS,
-    VERIFICATION_CODE_KEY,
+from homeassistant.config_entries import (
+    SOURCE_REAUTH,
+    SOURCE_RECONFIGURE,
+    ConfigFlowResult,
 )
-from .const import DOMAIN  # pylint:disable=unused-import
-from .exceptions import CannotConnect, InvalidAuth, RequireValidation
-from .gateway import AugustGateway
+from homeassistant.helpers import config_entry_oauth2_flow
+
+from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-DATA_SCHEMA = vol.Schema(
-    {
-        vol.Required(CONF_LOGIN_METHOD, default="phone"): vol.In(LOGIN_METHODS),
-        vol.Required(CONF_USERNAME): str,
-        vol.Required(CONF_PASSWORD): str,
-        vol.Optional(CONF_TIMEOUT, default=DEFAULT_TIMEOUT): vol.Coerce(int),
-    }
-)
 
-
-async def async_validate_input(
-    hass: core.HomeAssistant, data, august_gateway,
+class AugustConfigFlow(
+    config_entry_oauth2_flow.AbstractOAuth2FlowHandler, domain=DOMAIN
 ):
-    """Validate the user input allows us to connect.
-
-    Data has the keys from DATA_SCHEMA with values provided by the user.
-
-    Request configuration steps from the user.
-    """
-
-    code = data.get(VERIFICATION_CODE_KEY)
-
-    if code is not None:
-        result = await hass.async_add_executor_job(
-            august_gateway.authenticator.validate_verification_code, code
-        )
-        _LOGGER.debug("Verification code validation: %s", result)
-        if result != ValidationResult.VALIDATED:
-            raise RequireValidation
-
-    try:
-        august_gateway.authenticate()
-    except RequireValidation:
-        _LOGGER.debug(
-            "Requesting new verification code for %s via %s",
-            data.get(CONF_USERNAME),
-            data.get(CONF_LOGIN_METHOD),
-        )
-        if code is None:
-            await hass.async_add_executor_job(
-                august_gateway.authenticator.send_verification_code
-            )
-        raise
-
-    return {
-        "title": data.get(CONF_USERNAME),
-        "data": august_gateway.config_entry(),
-    }
-
-
-class AugustConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for August."""
 
     VERSION = 1
-    CONNECTION_CLASS = config_entries.CONN_CLASS_CLOUD_POLL
+    DOMAIN = DOMAIN
 
-    def __init__(self):
-        """Store an AugustGateway()."""
-        self._august_gateway = None
-        self.user_auth_details = {}
-        super().__init__()
+    @property
+    @override
+    def logger(self) -> logging.Logger:
+        """Return logger."""
+        return _LOGGER
 
-    async def async_step_user(self, user_input=None):
-        """Handle the initial step."""
-        if self._august_gateway is None:
-            self._august_gateway = AugustGateway(self.hass)
-        errors = {}
-        if user_input is not None:
-            self._august_gateway.async_setup(user_input)
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
+        """Handle configuration by re-auth."""
+        return await self.async_step_user()
 
-            try:
-                info = await async_validate_input(
-                    self.hass, user_input, self._august_gateway,
-                )
-                await self.async_set_unique_id(user_input[CONF_USERNAME])
-                return self.async_create_entry(title=info["title"], data=info["data"])
-            except CannotConnect:
-                errors["base"] = "cannot_connect"
-            except InvalidAuth:
-                errors["base"] = "invalid_auth"
-            except RequireValidation:
-                self.user_auth_details = user_input
+    async def async_step_reconfigure(
+        self, user_input: Mapping[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """User initiated reconfiguration."""
+        return await self.async_step_user()
 
-                return await self.async_step_validation()
-            except Exception:  # pylint: disable=broad-except
-                _LOGGER.exception("Unexpected exception")
-                errors["base"] = "unknown"
-
-        return self.async_show_form(
-            step_id="user", data_schema=DATA_SCHEMA, errors=errors
+    def _async_decode_jwt(self, encoded: str) -> dict[str, Any]:
+        """Decode JWT token."""
+        return jwt.decode(
+            encoded,
+            "",
+            verify=False,
+            options={"verify_signature": False},
+            algorithms=["HS256"],
         )
 
-    async def async_step_validation(self, user_input=None):
-        """Handle validation (2fa) step."""
-        if user_input:
-            return await self.async_step_user({**self.user_auth_details, **user_input})
+    async def _async_handle_reauth(
+        self, data: dict, decoded: dict[str, Any], user_id: str
+    ) -> ConfigFlowResult:
+        """Handle reauth flow."""
+        reauth_entry = self._get_reauth_entry()
+        assert reauth_entry.unique_id is not None
+        # Check if this is a migration from username (contains @) to user ID
+        if "@" not in reauth_entry.unique_id:
+            # This is a normal oauth reauth, enforce ID matching for security
+            await self.async_set_unique_id(user_id)
+            self._abort_if_unique_id_mismatch(reason="reauth_invalid_user")
+            return self.async_update_reload_and_abort(reauth_entry, data=data)
 
-        return self.async_show_form(
-            step_id="validation",
-            data_schema=vol.Schema(
-                {vol.Required(VERIFICATION_CODE_KEY): vol.All(str, vol.Strip)}
-            ),
-            description_placeholders={
-                CONF_USERNAME: self.user_auth_details.get(CONF_USERNAME),
-                CONF_LOGIN_METHOD: self.user_auth_details.get(CONF_LOGIN_METHOD),
-            },
+        # This is a one-time migration from username to user ID
+        # Only validate if the account has emails
+        emails: list[str]
+        if emails := decoded.get("email", []):
+            # Validate that the email matches before allowing migration
+            email_to_check_lower = reauth_entry.unique_id.casefold()
+            if not any(email.casefold() == email_to_check_lower for email in emails):
+                # Email doesn't match - this is a different account
+                return self.async_abort(reason="reauth_invalid_user")
+
+        # Email matches or no emails on account, update with new unique ID
+        return self.async_update_reload_and_abort(
+            reauth_entry, data=data, unique_id=user_id
         )
 
-    async def async_step_import(self, user_input):
-        """Handle import."""
-        await self.async_set_unique_id(user_input[CONF_USERNAME])
+    @override
+    async def async_oauth_create_entry(self, data: dict) -> ConfigFlowResult:
+        """Create an entry for the flow."""
+        # Decode JWT once
+        access_token = data["token"]["access_token"]
+        decoded = self._async_decode_jwt(access_token)
+        user_id = decoded["userId"]
+
+        if self.source == SOURCE_REAUTH:
+            return await self._async_handle_reauth(data, decoded, user_id)
+
+        await self.async_set_unique_id(user_id)
+        if self.source == SOURCE_RECONFIGURE:
+            self._abort_if_unique_id_mismatch()
+            return self.async_update_reload_and_abort(
+                self._get_reconfigure_entry(), data=data
+            )
         self._abort_if_unique_id_configured()
-
-        return await self.async_step_user(user_input)
+        return await super().async_oauth_create_entry(data)

@@ -1,136 +1,180 @@
-"""Config flow to configure the Elgato Key Light integration."""
-import logging
-from typing import Any, Dict, Optional
+"""Config flow to configure the Elgato Light integration."""
 
-from elgato import Elgato, ElgatoError, Info
-import voluptuous as vol
+from typing import Any, override
 
-from homeassistant.config_entries import CONN_CLASS_LOCAL_POLL, ConfigFlow
-from homeassistant.const import CONF_HOST, CONF_PORT
+from elgato import Elgato, ElgatoError
+import probatio
+
+from homeassistant.components import onboarding
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.const import CONF_HOST, CONF_MAC
+from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.typing import ConfigType
+from homeassistant.helpers.device_registry import format_mac
+from homeassistant.helpers.service_info.dhcp import DhcpServiceInfo
+from homeassistant.helpers.service_info.zeroconf import ZeroconfServiceInfo
 
-from .const import CONF_SERIAL_NUMBER, DOMAIN  # pylint: disable=unused-import
-
-_LOGGER = logging.getLogger(__name__)
+from .const import DOMAIN
 
 
 class ElgatoFlowHandler(ConfigFlow, domain=DOMAIN):
-    """Handle a Elgato Key Light config flow."""
+    """Handle a Elgato Light config flow."""
 
     VERSION = 1
-    CONNECTION_CLASS = CONN_CLASS_LOCAL_POLL
 
+    host: str
+    serial_number: str
+    mac: str | None = None
+
+    @override
     async def async_step_user(
-        self, user_input: Optional[ConfigType] = None
-    ) -> Dict[str, Any]:
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle a flow initiated by the user."""
         if user_input is None:
-            return self._show_setup_form()
+            return self._async_show_setup_form()
+
+        self.host = user_input[CONF_HOST]
 
         try:
-            info = await self._get_elgato_info(
-                user_input[CONF_HOST], user_input[CONF_PORT]
-            )
+            await self._get_elgato_serial_number(raise_on_progress=False)
         except ElgatoError:
-            return self._show_setup_form({"base": "connection_error"})
+            return self._async_show_setup_form({"base": "cannot_connect"})
 
-        # Check if already configured
-        await self.async_set_unique_id(info.serial_number)
-        self._abort_if_unique_id_configured()
+        return self._async_create_entry()
 
-        return self.async_create_entry(
-            title=info.serial_number,
-            data={
-                CONF_HOST: user_input[CONF_HOST],
-                CONF_PORT: user_input[CONF_PORT],
-                CONF_SERIAL_NUMBER: info.serial_number,
-            },
-        )
-
+    @override
     async def async_step_zeroconf(
-        self, user_input: Optional[ConfigType] = None
-    ) -> Dict[str, Any]:
+        self, discovery_info: ZeroconfServiceInfo
+    ) -> ConfigFlowResult:
         """Handle zeroconf discovery."""
-        if user_input is None:
-            return self.async_abort(reason="connection_error")
+        self.host = discovery_info.host
+        self.mac = discovery_info.properties.get("id")
 
-        # Hostname is format: my-ke.local.
-        host = user_input["hostname"].rstrip(".")
         try:
-            info = await self._get_elgato_info(host, user_input[CONF_PORT])
+            await self._get_elgato_serial_number()
         except ElgatoError:
-            return self.async_abort(reason="connection_error")
+            return self.async_abort(reason="cannot_connect")
 
-        # Check if already configured
-        await self.async_set_unique_id(info.serial_number)
-        self._abort_if_unique_id_configured()
+        if not onboarding.async_is_onboarded(self.hass):
+            return self._async_create_entry()
 
-        # pylint: disable=no-member # https://github.com/PyCQA/pylint/issues/3167
-        self.context.update(
-            {
-                CONF_HOST: host,
-                CONF_PORT: user_input[CONF_PORT],
-                CONF_SERIAL_NUMBER: info.serial_number,
-                "title_placeholders": {"serial_number": info.serial_number},
-            }
+        # pylint: disable-next=home-assistant-step_id-match-method
+        return self.async_show_form(
+            step_id="zeroconf_confirm",
+            description_placeholders={"serial_number": self.serial_number},
         )
 
-        # Prepare configuration flow
-        return self._show_confirm_dialog()
-
-    # pylint: disable=no-member # https://github.com/PyCQA/pylint/issues/3167
     async def async_step_zeroconf_confirm(
-        self, user_input: ConfigType = None
-    ) -> Dict[str, Any]:
+        self, _: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle a flow initiated by zeroconf."""
-        if user_input is None:
-            return self._show_confirm_dialog()
+        return self._async_create_entry()
 
-        try:
-            info = await self._get_elgato_info(
-                self.context.get(CONF_HOST), self.context.get(CONF_PORT)
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle reconfiguration of an existing Elgato device."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            elgato = Elgato(
+                host=user_input[CONF_HOST],
+                session=async_get_clientsession(self.hass),
             )
-        except ElgatoError:
-            return self.async_abort(reason="connection_error")
 
-        # Check if already configured
-        await self.async_set_unique_id(info.serial_number)
-        self._abort_if_unique_id_configured()
+            try:
+                info = await elgato.info()
+            except ElgatoError:
+                errors["base"] = "cannot_connect"
+            else:
+                await self.async_set_unique_id(info.serial_number)
+                self._abort_if_unique_id_mismatch(reason="different_device")
+                return self.async_update_reload_and_abort(
+                    self._get_reconfigure_entry(),
+                    data_updates={CONF_HOST: user_input[CONF_HOST]},
+                )
 
-        return self.async_create_entry(
-            title=self.context.get(CONF_SERIAL_NUMBER),
-            data={
-                CONF_HOST: self.context.get(CONF_HOST),
-                CONF_PORT: self.context.get(CONF_PORT),
-                CONF_SERIAL_NUMBER: self.context.get(CONF_SERIAL_NUMBER),
-            },
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=probatio.Schema(
+                {
+                    probatio.Required(
+                        CONF_HOST,
+                        default=self._get_reconfigure_entry().data[CONF_HOST],
+                    ): str,
+                }
+            ),
+            errors=errors,
         )
 
-    def _show_setup_form(self, errors: Optional[Dict] = None) -> Dict[str, Any]:
+    @override
+    async def async_step_dhcp(
+        self, discovery_info: DhcpServiceInfo
+    ) -> ConfigFlowResult:
+        """Handle DHCP discovery of a known Elgato device.
+
+        Only devices already configured (matched via ``registered_devices``)
+        reach this step. It is used to keep the stored host in sync with the
+        current IP address of the device.
+        """
+        mac = format_mac(discovery_info.macaddress)
+
+        for entry in self._async_current_entries():
+            if (entry_mac := entry.data.get(CONF_MAC)) is None or format_mac(
+                entry_mac
+            ) != mac:
+                continue
+            if entry.data[CONF_HOST] != discovery_info.ip:
+                self.hass.config_entries.async_update_entry(
+                    entry,
+                    data=entry.data | {CONF_HOST: discovery_info.ip},
+                )
+                self.hass.config_entries.async_schedule_reload(entry.entry_id)
+            return self.async_abort(reason="already_configured")
+
+        return self.async_abort(reason="no_devices_found")
+
+    @callback
+    def _async_show_setup_form(
+        self, errors: dict[str, str] | None = None
+    ) -> ConfigFlowResult:
         """Show the setup form to the user."""
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema(
+            data_schema=probatio.Schema(
                 {
-                    vol.Required(CONF_HOST): str,
-                    vol.Optional(CONF_PORT, default=9123): int,
+                    probatio.Required(CONF_HOST): str,
                 }
             ),
             errors=errors or {},
         )
 
-    def _show_confirm_dialog(self) -> Dict[str, Any]:
-        """Show the confirm dialog to the user."""
-        # pylint: disable=no-member # https://github.com/PyCQA/pylint/issues/3167
-        serial_number = self.context.get(CONF_SERIAL_NUMBER)
-        return self.async_show_form(
-            step_id="zeroconf_confirm",
-            description_placeholders={"serial_number": serial_number},
+    @callback
+    def _async_create_entry(self) -> ConfigFlowResult:
+        return self.async_create_entry(
+            title=self.serial_number,
+            data={
+                CONF_HOST: self.host,
+                CONF_MAC: self.mac,
+            },
         )
 
-    async def _get_elgato_info(self, host: str, port: int) -> Info:
-        """Get device information from an Elgato Key Light device."""
+    async def _get_elgato_serial_number(self, raise_on_progress: bool = True) -> None:
+        """Get device information from an Elgato Light device."""
         session = async_get_clientsession(self.hass)
-        elgato = Elgato(host, port=port, session=session,)
-        return await elgato.info()
+        elgato = Elgato(
+            host=self.host,
+            session=session,
+        )
+        info = await elgato.info()
+
+        # Check if already configured
+        await self.async_set_unique_id(
+            info.serial_number, raise_on_progress=raise_on_progress
+        )
+        self._abort_if_unique_id_configured(
+            updates={CONF_HOST: self.host, CONF_MAC: self.mac}
+        )
+
+        self.serial_number = info.serial_number

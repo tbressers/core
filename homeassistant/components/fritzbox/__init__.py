@@ -1,90 +1,123 @@
-"""Support for AVM Fritz!Box smarthome devices."""
-import logging
+"""Support for AVM FRITZ!SmartHome devices."""
 
-from pyfritzhome import Fritzhome, LoginError
-import voluptuous as vol
+from requests.exceptions import ConnectionError as RequestConnectionError, HTTPError
+from yarl import URL
 
+from homeassistant.components.binary_sensor import DOMAIN as BINARY_SENSOR_DOMAIN
 from homeassistant.const import (
-    CONF_DEVICES,
     CONF_HOST,
-    CONF_PASSWORD,
-    CONF_USERNAME,
+    CONF_VERIFY_SSL,
     EVENT_HOMEASSISTANT_STOP,
+    UnitOfTemperature,
 )
-from homeassistant.helpers import discovery
-import homeassistant.helpers.config_validation as cv
+from homeassistant.core import Event, HomeAssistant
+from homeassistant.helpers.device_registry import AnyDeviceEntry
+from homeassistant.helpers.entity_registry import RegistryEntry, async_migrate_entries
 
-_LOGGER = logging.getLogger(__name__)
-
-SUPPORTED_DOMAINS = ["binary_sensor", "climate", "switch", "sensor"]
-
-DOMAIN = "fritzbox"
-
-ATTR_STATE_BATTERY_LOW = "battery_low"
-ATTR_STATE_DEVICE_LOCKED = "device_locked"
-ATTR_STATE_HOLIDAY_MODE = "holiday_mode"
-ATTR_STATE_LOCKED = "locked"
-ATTR_STATE_SUMMER_MODE = "summer_mode"
-ATTR_STATE_WINDOW_OPEN = "window_open"
+from .const import DEFAULT_VERIFY_SSL, DOMAIN, LOGGER, PLATFORMS
+from .coordinator import FritzboxConfigEntry, FritzboxDataUpdateCoordinator
 
 
-CONFIG_SCHEMA = vol.Schema(
-    {
-        DOMAIN: vol.Schema(
-            {
-                vol.Required(CONF_DEVICES): vol.All(
-                    cv.ensure_list,
-                    [
-                        vol.Schema(
-                            {
-                                vol.Required(CONF_HOST): cv.string,
-                                vol.Required(CONF_PASSWORD): cv.string,
-                                vol.Required(CONF_USERNAME): cv.string,
-                            }
-                        )
-                    ],
+async def async_setup_entry(hass: HomeAssistant, entry: FritzboxConfigEntry) -> None:
+    """Set up the AVM FRITZ!SmartHome platforms."""
+
+    def _update_unique_id(entry: RegistryEntry) -> dict[str, str] | None:
+        """Update unique ID of entity entry."""
+        if (
+            entry.unit_of_measurement == UnitOfTemperature.CELSIUS
+            and "_temperature" not in entry.unique_id
+        ):
+            new_unique_id = f"{entry.unique_id}_temperature"
+            LOGGER.debug(
+                "Migrating unique_id [%s] to [%s]", entry.unique_id, new_unique_id
+            )
+            return {"new_unique_id": new_unique_id}
+
+        if entry.domain == BINARY_SENSOR_DOMAIN and "_" not in entry.unique_id:
+            new_unique_id = f"{entry.unique_id}_alarm"
+            LOGGER.debug(
+                "Migrating unique_id [%s] to [%s]", entry.unique_id, new_unique_id
+            )
+            return {"new_unique_id": new_unique_id}
+        return None
+
+    await async_migrate_entries(hass, entry.entry_id, _update_unique_id)
+
+    coordinator = FritzboxDataUpdateCoordinator(hass, entry)
+    await coordinator.async_setup()
+
+    entry.runtime_data = coordinator
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    def logout_fritzbox(event: Event) -> None:
+        """Close connections to this fritzbox."""
+        coordinator.fritz.logout()
+
+    entry.async_on_unload(
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, logout_fritzbox)
+    )
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: FritzboxConfigEntry) -> None:
+    """Unloading the AVM FRITZ!SmartHome platforms."""
+    try:
+        await hass.async_add_executor_job(entry.runtime_data.fritz.logout)
+    except (RequestConnectionError, HTTPError) as ex:
+        LOGGER.debug("logout failed with '%s', anyway continue with unload", ex)
+
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
+
+
+async def async_migrate_entry(
+    hass: HomeAssistant, config_entry: FritzboxConfigEntry
+) -> None:
+    """Migrate old config entry to a new format."""
+    LOGGER.debug(
+        "Migrating configuration from version %s.%s",
+        config_entry.version,
+        config_entry.minor_version,
+    )
+    if config_entry.version == 1:
+        new_data = {**config_entry.data}
+        if config_entry.minor_version < 2:
+            LOGGER.debug("Migrate config entry data to URL based configuration")
+            if "://" not in config_entry.data[CONF_HOST]:
+                host = URL().build(
+                    scheme="http",
+                    host=config_entry.data[CONF_HOST],
                 )
+            else:
+                host = config_entry.data[CONF_HOST]
+
+            new_data = {
+                **config_entry.data,
+                CONF_HOST: str(host),
+                CONF_VERIFY_SSL: DEFAULT_VERIFY_SSL,
             }
+
+        hass.config_entries.async_update_entry(
+            config_entry, data=new_data, version=1, minor_version=2
         )
-    },
-    extra=vol.ALLOW_EXTRA,
-)
+
+    LOGGER.debug(
+        "Migration to configuration version %s.%s successful",
+        config_entry.version,
+        config_entry.minor_version,
+    )
 
 
-def setup(hass, config):
-    """Set up the fritzbox component."""
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, entry: FritzboxConfigEntry, device: AnyDeviceEntry
+) -> bool:
+    """Remove Fritzbox config entry from a device."""
+    coordinator = entry.runtime_data
 
-    fritz_list = []
-
-    configured_devices = config[DOMAIN].get(CONF_DEVICES)
-    for device in configured_devices:
-        host = device.get(CONF_HOST)
-        username = device.get(CONF_USERNAME)
-        password = device.get(CONF_PASSWORD)
-        fritzbox = Fritzhome(host=host, user=username, password=password)
-        try:
-            fritzbox.login()
-            _LOGGER.info("Connected to device %s", device)
-        except LoginError:
-            _LOGGER.warning("Login to Fritz!Box %s as %s failed", host, username)
-            continue
-
-        fritz_list.append(fritzbox)
-
-    if not fritz_list:
-        _LOGGER.info("No fritzboxes configured")
-        return False
-
-    hass.data[DOMAIN] = fritz_list
-
-    def logout_fritzboxes(event):
-        """Close all connections to the fritzboxes."""
-        for fritz in fritz_list:
-            fritz.logout()
-
-    hass.bus.listen_once(EVENT_HOMEASSISTANT_STOP, logout_fritzboxes)
-
-    for domain in SUPPORTED_DOMAINS:
-        discovery.load_platform(hass, domain, DOMAIN, {}, config)
+    for identifier in device.identifiers:
+        if identifier[0] == DOMAIN and (
+            identifier[1] in coordinator.data.devices
+            or identifier[1] in coordinator.data.templates
+        ):
+            return False
 
     return True

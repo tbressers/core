@@ -1,90 +1,137 @@
 """Support for Freebox devices (Freebox v6 and Freebox mini 4K)."""
+
+from datetime import datetime, timedelta
 import logging
-import socket
 
-from aiofreepybox import Freepybox
-from aiofreepybox.exceptions import HttpRequestError
-import voluptuous as vol
+from aiohttp import ClientError
+from freebox_api.exceptions import HttpRequestError
 
-from homeassistant.components.discovery import SERVICE_FREEBOX
-from homeassistant.const import CONF_HOST, CONF_PORT, EVENT_HOMEASSISTANT_STOP
-from homeassistant.helpers import config_validation as cv, discovery
-from homeassistant.helpers.discovery import async_load_platform
+from homeassistant.const import CONF_HOST, CONF_PORT, EVENT_HOMEASSISTANT_STOP, Platform
+from homeassistant.core import Event, HomeAssistant
+from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers.event import async_track_time_interval
+
+from .const import DOMAIN, PLATFORMS
+from .router import FreeboxConfigEntry, FreeboxRouter, get_api
 
 _LOGGER = logging.getLogger(__name__)
 
-DOMAIN = "freebox"
-DATA_FREEBOX = DOMAIN
+SCAN_INTERVAL = timedelta(seconds=30)
 
-FREEBOX_CONFIG_FILE = "freebox.conf"
-
-CONFIG_SCHEMA = vol.Schema(
-    {
-        DOMAIN: vol.Schema(
-            {vol.Required(CONF_HOST): cv.string, vol.Required(CONF_PORT): cv.port}
-        )
-    },
-    extra=vol.ALLOW_EXTRA,
+# Old entity name suffixes that need rewriting to the entity description key.
+# Format: (platform, old name suffix, new key)
+_STATIC_UNIQUE_ID_MIGRATIONS: tuple[tuple[Platform, str, str], ...] = (
+    (Platform.SENSOR, "Freebox download speed", "rate_down"),
+    (Platform.SENSOR, "Freebox upload speed", "rate_up"),
+    (Platform.SENSOR, "Freebox missed calls", "missed"),
+    (Platform.BUTTON, "Reboot Freebox", "reboot"),
+    (Platform.BUTTON, "Mark calls as read", "mark_calls_as_read"),
+    (Platform.SWITCH, "Freebox WiFi", "wifi"),
 )
 
 
-async def async_setup(hass, config):
-    """Set up the Freebox component."""
-    conf = config.get(DOMAIN)
+async def async_migrate_entry(hass: HomeAssistant, entry: FreeboxConfigEntry) -> None:
+    """Migrate old config entries."""
+    if entry.version < 2:
+        api = await get_api(hass, entry.data[CONF_HOST])
+        try:
+            await api.open(entry.data[CONF_HOST], entry.data[CONF_PORT])
+            freebox_config = await api.system.get_config()
+        except HttpRequestError as err:
+            raise ConfigEntryNotReady(
+                translation_domain=DOMAIN,
+                translation_key="cannot_connect",
+                translation_placeholders={"host": entry.data[CONF_HOST]},
+            ) from err
+        finally:
+            await api.close()
 
-    async def discovery_dispatch(service, discovery_info):
-        if conf is None:
-            host = discovery_info.get("properties", {}).get("api_domain")
-            port = discovery_info.get("properties", {}).get("https_port")
-            _LOGGER.info("Discovered Freebox server: %s:%s", host, port)
-            await async_setup_freebox(hass, config, host, port)
+        mac: str = freebox_config["mac"]
+        entity_registry = er.async_get(hass)
 
-    discovery.async_listen(hass, SERVICE_FREEBOX, discovery_dispatch)
-
-    if conf is not None:
-        host = conf.get(CONF_HOST)
-        port = conf.get(CONF_PORT)
-        await async_setup_freebox(hass, config, host, port)
-
-    return True
-
-
-async def async_setup_freebox(hass, config, host, port):
-    """Start up the Freebox component platforms."""
-
-    app_desc = {
-        "app_id": "hass",
-        "app_name": "Home Assistant",
-        "app_version": "0.65",
-        "device_name": socket.gethostname(),
-    }
-
-    token_file = hass.config.path(FREEBOX_CONFIG_FILE)
-    api_version = "v6"
-
-    fbx = Freepybox(app_desc=app_desc, token_file=token_file, api_version=api_version)
-
-    try:
-        await fbx.open(host, port)
-    except HttpRequestError:
-        _LOGGER.exception("Failed to connect to Freebox")
-    else:
-        hass.data[DATA_FREEBOX] = fbx
-
-        async def async_freebox_reboot(call):
-            """Handle reboot service call."""
-            await fbx.system.reboot()
-
-        hass.services.async_register(DOMAIN, "reboot", async_freebox_reboot)
-
-        hass.async_create_task(async_load_platform(hass, "sensor", DOMAIN, {}, config))
-        hass.async_create_task(
-            async_load_platform(hass, "device_tracker", DOMAIN, {}, config)
+        migrations: list[tuple[Platform, str, str]] = [
+            (platform, f"{mac} {old_suffix}", f"{mac} {new_key}")
+            for platform, old_suffix, new_key in _STATIC_UNIQUE_ID_MIGRATIONS
+        ]
+        migrations.extend(
+            (
+                Platform.SENSOR,
+                f"{mac} Freebox {sensor['name']}",
+                f"{mac} {sensor['id']}",
+            )
+            for sensor in freebox_config.get("sensors", [])
         )
-        hass.async_create_task(async_load_platform(hass, "switch", DOMAIN, {}, config))
 
-        async def close_fbx(event):
-            """Close Freebox connection on HA Stop."""
-            await fbx.close()
+        for platform, old_uid, new_uid in migrations:
+            if entity_id := entity_registry.async_get_entity_id(
+                platform, DOMAIN, old_uid
+            ):
+                entity_registry.async_update_entity(entity_id, new_unique_id=new_uid)
+                _LOGGER.debug(
+                    "Migrated %s unique_id from %s to %s",
+                    entity_id,
+                    old_uid,
+                    new_uid,
+                )
 
-        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, close_fbx)
+        hass.config_entries.async_update_entry(entry, version=2)
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: FreeboxConfigEntry) -> None:
+    """Set up Freebox entry."""
+    api = await get_api(hass, entry.data[CONF_HOST])
+    # The library raises its own error only for a request the router refused,
+    # and leaves everything the transport can throw to aiohttp
+    try:
+        await api.open(entry.data[CONF_HOST], entry.data[CONF_PORT])
+        freebox_config = await api.system.get_config()
+        router = FreeboxRouter(hass, entry, api, freebox_config)
+        await router.update_all()
+    except (HttpRequestError, ClientError, TimeoutError) as err:
+        raise ConfigEntryNotReady from err
+
+    update_failed = False
+
+    async def _async_update_all(now: datetime) -> None:
+        """Update the router, logging a failure once until it recovers."""
+        nonlocal update_failed
+        try:
+            await router.update_all()
+        except (HttpRequestError, ClientError, TimeoutError) as err:
+            if not update_failed:
+                _LOGGER.warning("Error updating the Freebox: %r", err)
+            update_failed = True
+            return
+
+        if update_failed:
+            _LOGGER.info("Updating the Freebox works again")
+            update_failed = False
+
+    entry.async_on_unload(
+        async_track_time_interval(hass, _async_update_all, SCAN_INTERVAL)
+    )
+
+    entry.runtime_data = router
+
+    # Register the router device up front so child devices (home devices, disks)
+    # can deterministically resolve it as their via_device on any platform.
+    dr.async_get(hass).async_get_or_create_from_info(
+        config_entry_id=entry.entry_id, device_info=router.device_info
+    )
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    async def async_close_connection(event: Event) -> None:
+        """Close Freebox connection on HA Stop."""
+        await router.close()
+
+    entry.async_on_unload(
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, async_close_connection)
+    )
+    entry.async_on_unload(router.close)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: FreeboxConfigEntry) -> None:
+    """Unload a config entry."""
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)

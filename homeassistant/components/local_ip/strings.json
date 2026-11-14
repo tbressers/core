@@ -1,16 +1,11 @@
 {
   "config": {
-    "title": "Local IP Address",
     "step": {
       "user": {
-        "title": "Local IP Address",
-        "data": {
-          "name": "Sensor Name"
-        }
+        "description": "[%key:common::config_flow::description::confirm_setup%]",
+        "title": "[%key:component::local_ip::title%]"
       }
-    },
-    "abort": {
-      "already_configured": "Integration is already configured with an existing sensor with that name"
     }
-  }
+  },
+  "title": "Local IP Address"
 }

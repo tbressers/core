@@ -1,84 +1,73 @@
 """Implement the auth feature from Hass.io for Add-ons."""
+
+from http import HTTPStatus
 from ipaddress import ip_address
 import logging
 import os
 
 from aiohttp import web
 from aiohttp.web_exceptions import (
-    HTTPInternalServerError,
     HTTPNotFound,
+    HTTPServiceUnavailable,
     HTTPUnauthorized,
 )
-import voluptuous as vol
+import probatio
 
-from homeassistant.auth.models import User
-from homeassistant.components.http import HomeAssistantView
-from homeassistant.components.http.const import KEY_HASS_USER, KEY_REAL_IP
+from homeassistant.auth.const import GROUP_ID_ADMIN
+from homeassistant.auth.providers import homeassistant as auth_ha
+from homeassistant.components.http import KEY_HASS, KEY_HASS_USER, HomeAssistantView
+from homeassistant.components.http.const import (
+    DATA_SUPERVISOR_USER,
+    is_supervisor_unix_socket_request,
+)
 from homeassistant.components.http.data_validator import RequestDataValidator
-from homeassistant.core import callback
-from homeassistant.exceptions import HomeAssistantError
-import homeassistant.helpers.config_validation as cv
-from homeassistant.helpers.typing import HomeAssistantType
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import config_validation as cv
 
-from .const import ATTR_ADDON, ATTR_PASSWORD, ATTR_USERNAME
+from .const import ATTR_ADDON, ATTR_PASSWORD, ATTR_USERNAME, ENV_SUPERVISOR
 
 _LOGGER = logging.getLogger(__name__)
 
-
-SCHEMA_API_AUTH = vol.Schema(
-    {
-        vol.Required(ATTR_USERNAME): cv.string,
-        vol.Required(ATTR_PASSWORD): cv.string,
-        vol.Required(ATTR_ADDON): cv.string,
-    },
-    extra=vol.ALLOW_EXTRA,
-)
-
-SCHEMA_API_PASSWORD_RESET = vol.Schema(
-    {vol.Required(ATTR_USERNAME): cv.string, vol.Required(ATTR_PASSWORD): cv.string},
-    extra=vol.ALLOW_EXTRA,
-)
+ATTR_GROUP_IDS = "group_ids"
 
 
 @callback
-def async_setup_auth_view(hass: HomeAssistantType, user: User):
+def async_setup_auth_view(hass: HomeAssistant) -> None:
     """Auth setup."""
-    hassio_auth = HassIOAuth(hass, user)
-    hassio_password_reset = HassIOPasswordReset(hass, user)
-
-    hass.http.register_view(hassio_auth)
-    hass.http.register_view(hassio_password_reset)
+    hass.http.register_view(HassIOAuth(hass))
+    hass.http.register_view(HassIOPasswordReset(hass))
 
 
 class HassIOBaseAuth(HomeAssistantView):
     """Hass.io view to handle auth requests."""
 
-    def __init__(self, hass: HomeAssistantType, user: User):
+    def __init__(self, hass: HomeAssistant) -> None:
         """Initialize WebView."""
         self.hass = hass
-        self.user = user
 
-    def _check_access(self, request: web.Request):
+    def _check_access(self, request: web.Request) -> None:
         """Check if this call is from Supervisor."""
-        # Check caller IP
-        hassio_ip = os.environ["HASSIO"].split(":")[0]
-        if request[KEY_REAL_IP] != ip_address(hassio_ip):
-            _LOGGER.error("Invalid auth request from %s", request[KEY_REAL_IP])
-            raise HTTPUnauthorized()
+        user = self.hass.data.get(DATA_SUPERVISOR_USER)
+        if user is None:
+            raise HTTPServiceUnavailable
+
+        # Requests over the Supervisor Unix socket are authenticated by the
+        # http auth middleware as the Supervisor user, so the caller-IP check
+        # below does not apply (and would crash, since `peername` is empty for
+        # Unix sockets). The user-ID check still runs to ensure only the
+        # Supervisor user can reach this endpoint.
+        if not is_supervisor_unix_socket_request(request):
+            hassio_ip = os.environ[ENV_SUPERVISOR].split(":")[0]
+            assert request.transport
+            peername = request.transport.get_extra_info("peername")
+            if not peername or ip_address(peername[0]) != ip_address(hassio_ip):
+                _LOGGER.error("Invalid auth request from %s", request.remote)
+                raise HTTPUnauthorized
 
         # Check caller token
-        if request[KEY_HASS_USER].id != self.user.id:
+        if request[KEY_HASS_USER].id != user.id:
             _LOGGER.error("Invalid auth request from %s", request[KEY_HASS_USER].name)
-            raise HTTPUnauthorized()
-
-    def _get_provider(self):
-        """Return Homeassistant auth provider."""
-        prv = self.hass.auth.get_auth_provider("homeassistant", None)
-        if prv is not None:
-            return prv
-
-        _LOGGER.error("Can't find Home Assistant auth.")
-        raise HTTPNotFound()
+            raise HTTPUnauthorized
 
 
 class HassIOAuth(HassIOBaseAuth):
@@ -87,22 +76,43 @@ class HassIOAuth(HassIOBaseAuth):
     name = "api:hassio:auth"
     url = "/api/hassio_auth"
 
-    @RequestDataValidator(SCHEMA_API_AUTH)
-    async def post(self, request, data):
+    @RequestDataValidator(
+        probatio.Schema(
+            {
+                probatio.Required(ATTR_USERNAME): cv.string,
+                probatio.Required(ATTR_PASSWORD): cv.string,
+                probatio.Required(ATTR_ADDON): cv.string,
+            },
+            extra=probatio.ALLOW_EXTRA,
+        )
+    )
+    async def post(self, request: web.Request, data: dict[str, str]) -> web.Response:
         """Handle auth requests."""
         self._check_access(request)
-
-        await self._check_login(data[ATTR_USERNAME], data[ATTR_PASSWORD])
-        return web.Response(status=200)
-
-    async def _check_login(self, username, password):
-        """Check User credentials."""
-        provider = self._get_provider()
+        provider = auth_ha.async_get_provider(request.app[KEY_HASS])
 
         try:
-            await provider.async_validate_login(username, password)
-        except HomeAssistantError:
-            raise HTTPUnauthorized() from None
+            await provider.async_validate_login(
+                data[ATTR_USERNAME], data[ATTR_PASSWORD]
+            )
+        except auth_ha.InvalidAuth:
+            raise HTTPNotFound from None
+
+        credentials = await provider.async_get_or_create_credentials(
+            {ATTR_USERNAME: data[ATTR_USERNAME]}
+        )
+        user = await self.hass.auth.async_get_user_by_credentials(credentials)
+        if user is None:
+            return self.json({ATTR_GROUP_IDS: []})
+        # The login flow refuses inactive users as well
+        if not user.is_active:
+            raise HTTPNotFound
+
+        group_ids = [group.id for group in user.groups]
+        # Mirror User.is_admin, which also covers the owner
+        if user.is_admin and GROUP_ID_ADMIN not in group_ids:
+            group_ids.insert(0, GROUP_ID_ADMIN)
+        return self.json({ATTR_GROUP_IDS: group_ids})
 
 
 class HassIOPasswordReset(HassIOBaseAuth):
@@ -111,22 +121,25 @@ class HassIOPasswordReset(HassIOBaseAuth):
     name = "api:hassio:auth:password:reset"
     url = "/api/hassio_auth/password_reset"
 
-    @RequestDataValidator(SCHEMA_API_PASSWORD_RESET)
-    async def post(self, request, data):
+    @RequestDataValidator(
+        probatio.Schema(
+            {
+                probatio.Required(ATTR_USERNAME): cv.string,
+                probatio.Required(ATTR_PASSWORD): cv.string,
+            },
+            extra=probatio.ALLOW_EXTRA,
+        )
+    )
+    async def post(self, request: web.Request, data: dict[str, str]) -> web.Response:
         """Handle password reset requests."""
         self._check_access(request)
-
-        await self._change_password(data[ATTR_USERNAME], data[ATTR_PASSWORD])
-        return web.Response(status=200)
-
-    async def _change_password(self, username, password):
-        """Check User credentials."""
-        provider = self._get_provider()
+        provider = auth_ha.async_get_provider(request.app[KEY_HASS])
 
         try:
-            await self.hass.async_add_executor_job(
-                provider.data.change_password, username, password
+            await provider.async_change_password(
+                data[ATTR_USERNAME], data[ATTR_PASSWORD]
             )
-            await provider.data.async_save()
-        except HomeAssistantError:
-            raise HTTPInternalServerError()
+        except auth_ha.InvalidUser as err:
+            raise HTTPNotFound from err
+
+        return web.Response(status=HTTPStatus.OK)

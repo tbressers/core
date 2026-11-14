@@ -1,5 +1,13 @@
 """Constants for the homematic component."""
 
+from enum import StrEnum
+from typing import TYPE_CHECKING
+
+from homeassistant.util.hass_dict import HassKey
+
+if TYPE_CHECKING:
+    from .entity import HMHub
+
 DOMAIN = "homematic"
 
 DISCOVER_SWITCHES = "homematic.switch"
@@ -15,15 +23,12 @@ ATTR_DISCOVER_DEVICES = "devices"
 ATTR_PARAM = "param"
 ATTR_CHANNEL = "channel"
 ATTR_ADDRESS = "address"
+ATTR_DEVICE_TYPE = "device_type"
 ATTR_VALUE = "value"
-ATTR_VALUE_TYPE = "value_type"
 ATTR_INTERFACE = "interface"
 ATTR_ERRORCODE = "error"
 ATTR_MESSAGE = "message"
-ATTR_TIME = "time"
 ATTR_UNIQUE_ID = "unique_id"
-ATTR_PARAMSET_KEY = "paramset_key"
-ATTR_PARAMSET = "paramset"
 ATTR_DISCOVERY_TYPE = "discovery_type"
 ATTR_LOW_BAT = "LOW_BAT"
 ATTR_LOWBAT = "LOWBAT"
@@ -32,19 +37,15 @@ EVENT_KEYPRESS = "homematic.keypress"
 EVENT_IMPULSE = "homematic.impulse"
 EVENT_ERROR = "homematic.error"
 
-SERVICE_VIRTUALKEY = "virtualkey"
-SERVICE_RECONNECT = "reconnect"
-SERVICE_SET_VARIABLE_VALUE = "set_variable_value"
-SERVICE_SET_DEVICE_VALUE = "set_device_value"
-SERVICE_SET_INSTALL_MODE = "set_install_mode"
-SERVICE_PUT_PARAMSET = "put_paramset"
 
 HM_DEVICE_TYPES = {
     DISCOVER_SWITCHES: [
         "Switch",
         "SwitchPowermeter",
         "IOSwitch",
+        "IOSwitchNoInhibit",
         "IPSwitch",
+        "IPSwitchRssiDevice",
         "RFSiren",
         "IPSwitchPowermeter",
         "HMWIOSwitch",
@@ -55,6 +56,14 @@ HM_DEVICE_TYPES = {
         "IPKeySwitch",
         "IPKeySwitchLevel",
         "IPMultiIO",
+        "IPWSwitch",
+        "IOSwitchWireless",
+        "IPSwitchRssiDevice",
+        "IPWIODevice",
+        "IPSwitchBattery",
+        "IPMultiIOPCB",
+        "IPGarageSwitch",
+        "IPWHS2",
     ],
     DISCOVER_LIGHTS: [
         "Dimmer",
@@ -63,11 +72,15 @@ HM_DEVICE_TYPES = {
         "IPDimmer",
         "ColorEffectLight",
         "IPKeySwitchLevel",
+        "ColdWarmDimmer",
+        "IPWDimmer",
     ],
     DISCOVER_SENSORS: [
         "SwitchPowermeter",
         "Motion",
         "MotionV2",
+        "MotionIPV2",
+        "MotionIPContactSabotage",
         "RemoteMotion",
         "MotionIP",
         "ThermostatWall",
@@ -102,9 +115,23 @@ HM_DEVICE_TYPES = {
         "IPBrightnessSensor",
         "IPGarage",
         "UniversalSensor",
-        "MotionIPV2",
         "IPMultiIO",
         "IPThermostatWall2",
+        "IPRemoteMotionV2",
+        "HBUNISenWEA",
+        "PresenceIPW",
+        "IPRainSensor",
+        "ValveBox",
+        "IPKeyBlind",
+        "IPKeyBlindTilt",
+        "IPLanRouter",
+        "TempModuleSTE2",
+        "IPMultiIOPCB",
+        "ValveBoxW",
+        "CO2SensorIP",
+        "IPLockDLD",
+        "ParticulateMatterSensorIP",
+        "IPRemoteMotionV2W",
     ],
     DISCOVER_CLIMATE: [
         "Thermostat",
@@ -117,14 +144,18 @@ HM_DEVICE_TYPES = {
         "ThermostatGroup",
         "IPThermostatWall230V",
         "IPThermostatWall2",
+        "IPWThermostatWall",
     ],
     DISCOVER_BINARY_SENSORS: [
         "ShutterContact",
         "Smoke",
         "SmokeV2",
+        "SmokeV2Team",
         "Motion",
         "MotionV2",
         "MotionIP",
+        "MotionIPV2",
+        "MotionIPContactSabotage",
         "RemoteMotion",
         "WeatherSensor",
         "TiltSensor",
@@ -134,18 +165,35 @@ HM_DEVICE_TYPES = {
         "Rain",
         "WiredSensor",
         "PresenceIP",
+        "PresenceIPW",
         "IPWeatherSensor",
         "IPPassageSensor",
         "SmartwareMotion",
         "IPWeatherSensorPlus",
-        "MotionIPV2",
         "WaterIP",
         "IPMultiIO",
         "TiltIP",
         "IPShutterContactSabotage",
         "IPContact",
+        "IPRemoteMotionV2",
+        "IPWInputDevice",
+        "IPWMotionDection",
+        "IPAlarmSensor",
+        "IPRainSensor",
+        "IPLanRouter",
+        "IPMultiIOPCB",
+        "IPWHS2",
+        "IPRemoteMotionV2W",
     ],
-    DISCOVER_COVER: ["Blind", "KeyBlind", "IPKeyBlind", "IPKeyBlindTilt"],
+    DISCOVER_COVER: [
+        "Blind",
+        "KeyBlind",
+        "IPKeyBlind",
+        "IPKeyBlindTilt",
+        "IPGarage",
+        "IPKeyBlindMulti",
+        "IPWKeyBlindMulti",
+    ],
     DISCOVER_LOCKS: ["KeyMatic"],
 }
 
@@ -159,30 +207,37 @@ HM_IGNORE_DISCOVERY_NODE_EXCEPTIONS = {
         "IPWeatherSensorBasic",
         "IPThermostatWall",
         "IPThermostatWall2",
+        "ParticulateMatterSensorIP",
+        "CO2SensorIP",
+        "TempModuleSTE2",
     ]
 }
 
-HM_ATTRIBUTE_SUPPORT = {
-    "LOWBAT": ["battery", {0: "High", 1: "Low"}],
-    "LOW_BAT": ["battery", {0: "High", 1: "Low"}],
-    "ERROR": ["error", {0: "No"}],
-    "ERROR_SABOTAGE": ["sabotage", {0: "No", 1: "Yes"}],
-    "SABOTAGE": ["sabotage", {0: "No", 1: "Yes"}],
-    "RSSI_PEER": ["rssi_peer", {}],
-    "RSSI_DEVICE": ["rssi_device", {}],
-    "VALVE_STATE": ["valve", {}],
-    "LEVEL": ["level", {}],
-    "BATTERY_STATE": ["battery", {}],
-    "CONTROL_MODE": [
+HM_ATTRIBUTE_SUPPORT: dict[str, tuple[str, dict[int, str]]] = {
+    "LOWBAT": ("battery", {0: "High", 1: "Low"}),
+    "LOW_BAT": ("battery", {0: "High", 1: "Low"}),
+    "ERROR": ("error", {0: "No"}),
+    "ERROR_SABOTAGE": ("sabotage", {0: "No", 1: "Yes"}),
+    "SABOTAGE": ("sabotage", {0: "No", 1: "Yes"}),
+    "RSSI_PEER": ("rssi_peer", {}),
+    "RSSI_DEVICE": ("rssi_device", {}),
+    "VALVE_STATE": ("valve", {}),
+    "LEVEL": ("level", {}),
+    "BATTERY_STATE": ("battery", {}),
+    "CONTROL_MODE": (
         "mode",
         {0: "Auto", 1: "Manual", 2: "Away", 3: "Boost", 4: "Comfort", 5: "Lowering"},
-    ],
-    "POWER": ["power", {}],
-    "CURRENT": ["current", {}],
-    "VOLTAGE": ["voltage", {}],
-    "OPERATING_VOLTAGE": ["voltage", {}],
-    "WORKING": ["working", {0: "No", 1: "Yes"}],
-    "STATE_UNCERTAIN": ["state_uncertain", {}],
+    ),
+    "POWER": ("power", {}),
+    "CURRENT": ("current", {}),
+    "VOLTAGE": ("voltage", {}),
+    "OPERATING_VOLTAGE": ("voltage", {}),
+    "WORKING": ("working", {0: "No", 1: "Yes"}),
+    "STATE_UNCERTAIN": ("state_uncertain", {}),
+    "SENDERID": ("last_senderid", {}),
+    "SENDERADDRESS": ("last_senderaddress", {}),
+    "ERROR_ALARM_TEST": ("error_alarm_test", {0: "No", 1: "Yes"}),
+    "ERROR_SMOKE_CHAMBER": ("error_smoke_chamber", {0: "No", 1: "Yes"}),
 }
 
 HM_PRESS_EVENTS = [
@@ -200,13 +255,40 @@ CONF_RESOLVENAMES_OPTIONS = ["metadata", "json", "xml", False]
 DATA_HOMEMATIC = "homematic"
 DATA_STORE = "homematic_store"
 DATA_CONF = "homematic_conf"
+DATA_HUBS: HassKey[list[HMHub]] = HassKey("homematic_hubs")
 
 CONF_INTERFACES = "interfaces"
 CONF_LOCAL_IP = "local_ip"
 CONF_LOCAL_PORT = "local_port"
-CONF_PORT = "port"
-CONF_PATH = "path"
 CONF_CALLBACK_IP = "callback_ip"
 CONF_CALLBACK_PORT = "callback_port"
 CONF_RESOLVENAMES = "resolvenames"
 CONF_JSONPORT = "jsonport"
+
+
+class HomematicService(StrEnum):
+    """Store keys for Homematic services."""
+
+    VIRTUALKEY = "virtualkey"
+    SET_VARIABLE_VALUE = "set_variable_value"
+    SET_DEVICE_VALUE = "set_device_value"
+    RECONNECT = "reconnect"
+    SET_INSTALL_MODE = "set_install_mode"
+    PUT_PARAMSET = "put_paramset"
+
+
+class HomematicServiceArgument(StrEnum):
+    """Store keys for Homematic service arguments."""
+
+    ADDRESS = "address"
+    CHANNEL = "channel"
+    PARAM = "param"
+    INTERFACE = "interface"
+    NAME = "name"
+    VALUE = "value"
+    VALUE_TYPE = "value_type"
+    MODE = "mode"
+    TIME = "time"
+    PARAMSET_KEY = "paramset_key"
+    PARAMSET = "paramset"
+    RX_MODE = "rx_mode"

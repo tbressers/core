@@ -1,369 +1,98 @@
 """Support for August devices."""
-import asyncio
-import itertools
-import logging
 
-from august.api import AugustApiHTTPError
-from august.authenticator import ValidationResult
-from requests import RequestException
-import voluptuous as vol
+from pathlib import Path
+from typing import cast
 
-from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
-from homeassistant.const import CONF_PASSWORD, CONF_TIMEOUT, CONF_USERNAME
+from aiohttp import ClientError
+from yalexs.exceptions import AugustApiAIOHTTPError
+from yalexs.manager.exceptions import CannotConnect, InvalidAuth, RequireValidation
+from yalexs.manager.gateway import Config as YaleXSConfig
+
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
-import homeassistant.helpers.config_validation as cv
-
-from .activity import ActivityStream
-from .const import (
-    AUGUST_COMPONENTS,
-    CONF_ACCESS_TOKEN_CACHE_FILE,
-    CONF_INSTALL_ID,
-    CONF_LOGIN_METHOD,
-    DATA_AUGUST,
-    DEFAULT_AUGUST_CONFIG_FILE,
-    DEFAULT_NAME,
-    DEFAULT_TIMEOUT,
-    DOMAIN,
-    LOGIN_METHODS,
-    MIN_TIME_BETWEEN_DETAIL_UPDATES,
-    VERIFICATION_CODE_KEY,
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    ConfigEntryNotReady,
+    OAuth2TokenRequestBaseError,
 )
-from .exceptions import InvalidAuth, RequireValidation
+from homeassistant.helpers import device_registry as dr, issue_registry as ir
+from homeassistant.helpers.config_entry_oauth2_flow import (
+    OAuth2Session,
+    async_get_config_entry_implementation,
+)
+
+from .const import DEFAULT_AUGUST_BRAND, DOMAIN, PLATFORMS
+from .data import AugustData
 from .gateway import AugustGateway
-from .subscriber import AugustSubscriberMixin
+from .util import async_create_august_clientsession
 
-_LOGGER = logging.getLogger(__name__)
-
-TWO_FA_REVALIDATE = "verify_configurator"
-
-CONFIG_SCHEMA = vol.Schema(
-    {
-        DOMAIN: vol.Schema(
-            {
-                vol.Required(CONF_LOGIN_METHOD): vol.In(LOGIN_METHODS),
-                vol.Required(CONF_USERNAME): cv.string,
-                vol.Required(CONF_PASSWORD): cv.string,
-                vol.Optional(CONF_INSTALL_ID): cv.string,
-                vol.Optional(CONF_TIMEOUT, default=DEFAULT_TIMEOUT): cv.positive_int,
-            }
-        )
-    },
-    extra=vol.ALLOW_EXTRA,
-)
+type AugustConfigEntry = ConfigEntry[AugustData]
 
 
-async def async_request_validation(hass, config_entry, august_gateway):
-    """Request a new verification code from the user."""
-
-    #
-    # In the future this should start a new config flow
-    # instead of using the legacy configurator
-    #
-    _LOGGER.error("Access token is no longer valid.")
-    configurator = hass.components.configurator
-    entry_id = config_entry.entry_id
-
-    async def async_august_configuration_validation_callback(data):
-        code = data.get(VERIFICATION_CODE_KEY)
-        result = await hass.async_add_executor_job(
-            august_gateway.authenticator.validate_verification_code, code
-        )
-
-        if result == ValidationResult.INVALID_VERIFICATION_CODE:
-            configurator.async_notify_errors(
-                hass.data[DOMAIN][entry_id][TWO_FA_REVALIDATE],
-                "Invalid verification code, please make sure you are using the latest code and try again.",
-            )
-        elif result == ValidationResult.VALIDATED:
-            return await async_setup_august(hass, config_entry, august_gateway)
-
-        return False
-
-    if TWO_FA_REVALIDATE not in hass.data[DOMAIN][entry_id]:
-        await hass.async_add_executor_job(
-            august_gateway.authenticator.send_verification_code
-        )
-
-    entry_data = config_entry.data
-    login_method = entry_data.get(CONF_LOGIN_METHOD)
-    username = entry_data.get(CONF_USERNAME)
-
-    hass.data[DOMAIN][entry_id][TWO_FA_REVALIDATE] = configurator.async_request_config(
-        f"{DEFAULT_NAME} ({username})",
-        async_august_configuration_validation_callback,
-        description="August must be re-verified. Please check your {} ({}) and enter the verification "
-        "code below".format(login_method, username),
-        submit_caption="Verify",
-        fields=[
-            {"id": VERIFICATION_CODE_KEY, "name": "Verification code", "type": "string"}
-        ],
-    )
-    return
-
-
-async def async_setup_august(hass, config_entry, august_gateway):
-    """Set up the August component."""
-
-    entry_id = config_entry.entry_id
-    hass.data[DOMAIN].setdefault(entry_id, {})
-
-    try:
-        august_gateway.authenticate()
-    except RequireValidation:
-        await async_request_validation(hass, config_entry, august_gateway)
-        return False
-    except InvalidAuth:
-        _LOGGER.error("Password is no longer valid. Please set up August again")
-        return False
-
-    # We still use the configurator to get a new 2fa code
-    # when needed since config_flow doesn't have a way
-    # to re-request if it expires
-    if TWO_FA_REVALIDATE in hass.data[DOMAIN][entry_id]:
-        hass.components.configurator.async_request_done(
-            hass.data[DOMAIN][entry_id].pop(TWO_FA_REVALIDATE)
-        )
-
-    hass.data[DOMAIN][entry_id][DATA_AUGUST] = await hass.async_add_executor_job(
-        AugustData, hass, august_gateway
-    )
-    await hass.data[DOMAIN][entry_id][DATA_AUGUST].activity_stream.async_setup()
-
-    for component in AUGUST_COMPONENTS:
-        hass.async_create_task(
-            hass.config_entries.async_forward_entry_setup(config_entry, component)
-        )
-
-    return True
-
-
-async def async_setup(hass: HomeAssistant, config: dict):
-    """Set up the August component from YAML."""
-
-    conf = config.get(DOMAIN)
-    hass.data.setdefault(DOMAIN, {})
-
-    if not conf:
-        return True
-
-    hass.async_create_task(
-        hass.config_entries.flow.async_init(
-            DOMAIN,
-            context={"source": SOURCE_IMPORT},
-            data={
-                CONF_LOGIN_METHOD: conf.get(CONF_LOGIN_METHOD),
-                CONF_USERNAME: conf.get(CONF_USERNAME),
-                CONF_PASSWORD: conf.get(CONF_PASSWORD),
-                CONF_INSTALL_ID: conf.get(CONF_INSTALL_ID),
-                CONF_ACCESS_TOKEN_CACHE_FILE: DEFAULT_AUGUST_CONFIG_FILE,
-            },
-        )
-    )
-    return True
-
-
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
+async def async_setup_entry(hass: HomeAssistant, entry: AugustConfigEntry) -> None:
     """Set up August from a config entry."""
+    # Check if this is a legacy config entry that needs migration to OAuth
+    if "auth_implementation" not in entry.data:
+        # This is a legacy entry using username/password, trigger reauth
+        raise ConfigEntryAuthFailed("Migration to OAuth required")
 
-    august_gateway = AugustGateway(hass)
-    august_gateway.async_setup(entry.data)
+    session = async_create_august_clientsession(hass)
+    implementation = await async_get_config_entry_implementation(hass, entry)
+    oauth_session = OAuth2Session(hass, entry, implementation)
+    august_gateway = AugustGateway(Path(hass.config.config_dir), session, oauth_session)
+    try:
+        await async_setup_august(hass, entry, august_gateway)
+    except OAuth2TokenRequestBaseError:
+        raise
+    except (RequireValidation, InvalidAuth) as err:
+        raise ConfigEntryAuthFailed from err
+    except TimeoutError as err:
+        raise ConfigEntryNotReady("Timed out connecting to august api") from err
+    except (
+        AugustApiAIOHTTPError,
+        ClientError,
+        CannotConnect,
+    ) as err:
+        raise ConfigEntryNotReady from err
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    return await async_setup_august(hass, entry, august_gateway)
+
+async def async_remove_entry(hass: HomeAssistant, entry: AugustConfigEntry) -> None:
+    """Remove an August config entry."""
+    ir.async_delete_issue(hass, DOMAIN, "yale_brand_migration")
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
+async def async_unload_entry(hass: HomeAssistant, entry: AugustConfigEntry) -> None:
     """Unload a config entry."""
-    unload_ok = all(
-        await asyncio.gather(
-            *[
-                hass.config_entries.async_forward_entry_unload(entry, component)
-                for component in AUGUST_COMPONENTS
-            ]
-        )
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)
+
+
+async def async_setup_august(
+    hass: HomeAssistant, entry: AugustConfigEntry, august_gateway: AugustGateway
+) -> None:
+    """Set up the August component."""
+    config = cast(YaleXSConfig, entry.data)
+    await august_gateway.async_setup({**config, "brand": DEFAULT_AUGUST_BRAND})
+    await august_gateway.async_authenticate()
+    await august_gateway.async_refresh_access_token_if_needed()
+    data = entry.runtime_data = AugustData(hass, august_gateway)
+    entry.async_on_unload(
+        hass.bus.async_listen(EVENT_HOMEASSISTANT_STOP, data.async_stop)
     )
-
-    if unload_ok:
-        hass.data[DOMAIN].pop(entry.entry_id)
-
-    return unload_ok
+    entry.async_on_unload(data.async_stop)
+    await data.async_setup()
 
 
-class AugustData(AugustSubscriberMixin):
-    """August data object."""
-
-    def __init__(self, hass, august_gateway):
-        """Init August data object."""
-        super().__init__(hass, MIN_TIME_BETWEEN_DETAIL_UPDATES)
-        self._hass = hass
-        self._august_gateway = august_gateway
-        self._api = august_gateway.api
-        self._device_detail_by_id = {}
-
-        locks = self._api.get_operable_locks(self._august_gateway.access_token) or []
-        doorbells = self._api.get_doorbells(self._august_gateway.access_token) or []
-
-        self._doorbells_by_id = dict((device.device_id, device) for device in doorbells)
-        self._locks_by_id = dict((device.device_id, device) for device in locks)
-        self._house_ids = set(
-            device.house_id for device in itertools.chain(locks, doorbells)
-        )
-
-        self._refresh_device_detail_by_ids(
-            [device.device_id for device in itertools.chain(locks, doorbells)]
-        )
-
-        # We remove all devices that we are missing
-        # detail as we cannot determine if they are usable.
-        # This also allows us to avoid checking for
-        # detail being None all over the place
-        self._remove_inoperative_locks()
-        self._remove_inoperative_doorbells()
-
-        self.activity_stream = ActivityStream(
-            hass, self._api, self._august_gateway, self._house_ids
-        )
-
-    @property
-    def doorbells(self):
-        """Return a list of py-august Doorbell objects."""
-        return self._doorbells_by_id.values()
-
-    @property
-    def locks(self):
-        """Return a list of py-august Lock objects."""
-        return self._locks_by_id.values()
-
-    def get_device_detail(self, device_id):
-        """Return the py-august LockDetail or DoorbellDetail object for a device."""
-        return self._device_detail_by_id[device_id]
-
-    def _refresh(self, time):
-        self._refresh_device_detail_by_ids(self._subscriptions.keys())
-
-    def _refresh_device_detail_by_ids(self, device_ids_list):
-        for device_id in device_ids_list:
-            if device_id in self._locks_by_id:
-                self._update_device_detail(
-                    self._locks_by_id[device_id], self._api.get_lock_detail
-                )
-            elif device_id in self._doorbells_by_id:
-                self._update_device_detail(
-                    self._doorbells_by_id[device_id], self._api.get_doorbell_detail
-                )
-            _LOGGER.debug(
-                "signal_device_id_update (from detail updates): %s", device_id,
-            )
-            self.signal_device_id_update(device_id)
-
-    def _update_device_detail(self, device, api_call):
-        _LOGGER.debug(
-            "Started retrieving detail for %s (%s)",
-            device.device_name,
-            device.device_id,
-        )
-
-        try:
-            self._device_detail_by_id[device.device_id] = api_call(
-                self._august_gateway.access_token, device.device_id
-            )
-        except RequestException as ex:
-            _LOGGER.error(
-                "Request error trying to retrieve %s details for %s. %s",
-                device.device_id,
-                device.device_name,
-                ex,
-            )
-        _LOGGER.debug(
-            "Completed retrieving detail for %s (%s)",
-            device.device_name,
-            device.device_id,
-        )
-
-    def _get_device_name(self, device_id):
-        """Return doorbell or lock name as August has it stored."""
-        if self._locks_by_id.get(device_id):
-            return self._locks_by_id[device_id].device_name
-        if self._doorbells_by_id.get(device_id):
-            return self._doorbells_by_id[device_id].device_name
-
-    def lock(self, device_id):
-        """Lock the device."""
-        return self._call_api_op_requires_bridge(
-            device_id,
-            self._api.lock_return_activities,
-            self._august_gateway.access_token,
-            device_id,
-        )
-
-    def unlock(self, device_id):
-        """Unlock the device."""
-        return self._call_api_op_requires_bridge(
-            device_id,
-            self._api.unlock_return_activities,
-            self._august_gateway.access_token,
-            device_id,
-        )
-
-    def _call_api_op_requires_bridge(self, device_id, func, *args, **kwargs):
-        """Call an API that requires the bridge to be online and will change the device state."""
-        ret = None
-        try:
-            ret = func(*args, **kwargs)
-        except AugustApiHTTPError as err:
-            device_name = self._get_device_name(device_id)
-            if device_name is None:
-                device_name = f"DeviceID: {device_id}"
-            raise HomeAssistantError(f"{device_name}: {err}")
-
-        return ret
-
-    def _remove_inoperative_doorbells(self):
-        doorbells = list(self.doorbells)
-        for doorbell in doorbells:
-            device_id = doorbell.device_id
-            doorbell_is_operative = False
-            doorbell_detail = self._device_detail_by_id.get(device_id)
-            if doorbell_detail is None:
-                _LOGGER.info(
-                    "The doorbell %s could not be setup because the system could not fetch details about the doorbell.",
-                    doorbell.device_name,
-                )
-            else:
-                doorbell_is_operative = True
-
-            if not doorbell_is_operative:
-                del self._doorbells_by_id[device_id]
-                del self._device_detail_by_id[device_id]
-
-    def _remove_inoperative_locks(self):
-        # Remove non-operative locks as there must
-        # be a bridge (August Connect) for them to
-        # be usable
-        locks = list(self.locks)
-
-        for lock in locks:
-            device_id = lock.device_id
-            lock_is_operative = False
-            lock_detail = self._device_detail_by_id.get(device_id)
-            if lock_detail is None:
-                _LOGGER.info(
-                    "The lock %s could not be setup because the system could not fetch details about the lock.",
-                    lock.device_name,
-                )
-            elif lock_detail.bridge is None:
-                _LOGGER.info(
-                    "The lock %s could not be setup because it does not have a bridge (Connect).",
-                    lock.device_name,
-                )
-            elif not lock_detail.bridge.operative:
-                _LOGGER.info(
-                    "The lock %s could not be setup because the bridge (Connect) is not operative.",
-                    lock.device_name,
-                )
-            else:
-                lock_is_operative = True
-
-            if not lock_is_operative:
-                del self._locks_by_id[device_id]
-                del self._device_detail_by_id[device_id]
+async def async_remove_config_entry_device(
+    hass: HomeAssistant,
+    config_entry: AugustConfigEntry,
+    device_entry: dr.AnyDeviceEntry,
+) -> bool:
+    """Remove august config entry from a device if its no longer present."""
+    return not any(
+        identifier
+        for identifier in device_entry.identifiers
+        if identifier[0] == DOMAIN
+        and config_entry.runtime_data.get_device(identifier[1])
+    )
